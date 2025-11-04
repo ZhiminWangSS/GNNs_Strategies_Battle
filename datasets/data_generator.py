@@ -248,7 +248,7 @@ class GraphGenerator:
         print(str(method), parts)
 
         print(f"Graph successfully partitioned into {num_parts} parts ({method}) at {output_dir}")
-    def get_dataloader_for_node_classification(self, pid, partition_method, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions', batch_size: int = 32):
+    def get_dataloader_for_node_classification(self, pid, partition_method,batch_size: int = 32, train_ratio=0.8, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions'):
         """
         加载指定pid对应的子图并为子图创建 DataLoader
         """
@@ -262,13 +262,19 @@ class GraphGenerator:
         # Node sampler: 随机邻居采样 (层数 = fanout 数量)
         sampler = dgl.dataloading.NeighborSampler(sampler_fanouts)
 
-        # 节点索引
-        node_ids = torch.arange(subg.num_nodes())
+        # 全部节点索引
+        all_nodes = torch.arange(subg.num_nodes())
+        num_train = int(len(all_nodes) * train_ratio)
 
-        # 创建 DGL 的 DataLoader
-        dataloader = dgl.dataloading.DataLoader(
+        # 随机划分
+        perm = torch.randperm(len(all_nodes))
+        train_nodes = all_nodes[perm[:num_train]]
+        test_nodes = all_nodes[perm[num_train:]]
+
+        # 构建训练 DataLoader
+        train_loader = dgl.dataloading.DataLoader(
             subg,
-            node_ids,
+            train_nodes,
             sampler,
             batch_size=batch_size,
             shuffle=True,
@@ -277,7 +283,21 @@ class GraphGenerator:
             device=device
         )
 
-        return dataloader, subg
+        # 构建测试 DataLoader
+        test_loader = dgl.dataloading.DataLoader(
+            subg,
+            test_nodes,
+            sampler,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            device=device
+        )
+
+        print(f"Subgraph {pid} -> {len(train_nodes)} train nodes, {len(test_nodes)} test nodes")
+
+        return train_loader, test_loader, subg
 
 
 if __name__ == "__main__":
@@ -290,9 +310,9 @@ if __name__ == "__main__":
     gen.partition_graph_for_node_classification(g, num_parts=3, method='metis', output_dir='./tmp/graph_parts')
     gen.partition_graph_for_node_classification(g, num_parts=3, method='random', output_dir='./tmp/graph_parts')
 
-    loader, _ = gen.get_dataloader_for_node_classification(pid=0, partition_method='metis', partition_dir='./tmp/graph_parts')
+    train_loader, test_loader, _ = gen.get_dataloader_for_node_classification(pid=0, partition_method='random', partition_dir='./tmp/graph_parts')
     
-    for input_nodes, output_nodes, blocks in loader:
+    for input_nodes, output_nodes, blocks in train_loader:
         print("Input nodes:", input_nodes)
         print("Output nodes:", output_nodes)
         print("Blocks:", blocks)
