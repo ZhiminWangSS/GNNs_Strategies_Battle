@@ -8,8 +8,8 @@ Compare different parallel training strategies (GDP, NFP, SNP, DNP) for Graph Ne
 - Python 3.11
 - [uv](https://github.com/astral-sh/uv) - Install with: `pip install uv`
 
-
 **Tested on Linux**
+
 ```bash
 uv venv --python 3.11
 source .venv/bin/activate
@@ -23,14 +23,17 @@ uv sync
 python gdp_example.py
 ```
 
-## Project Structure
+## Project Structure	
 
 ```
-├── datasets/         # Dataset loaders (OGBN-arxiv, OGBL-ddi)
-├── models/           # GCN model
-├── strategies/       # Parallel strategies for train and test (GDP, NFP, SNP, DNP)
+├── dataset_generator # generator.py #linjia
+├── models/           # GCN model.py
+├── training/       # sampling strategies for train and test 
+	- partition 随机划分 (Random Partition) METIS 划分 (METIS Partition) 非均匀划分 (Non-Uniform Partition)
 ├── metrics/          # Training metrics (communication, convergence)
 ```
+
+
 
 ### Stage 1 Infrastructure construction
 
