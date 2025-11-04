@@ -6,6 +6,10 @@ from typing import Optional, List, Dict
 import random
 import os, shutil
 from sklearn.preprocessing import MinMaxScaler
+import dgl.distributed as dist_dgl
+import multiprocessing
+import scipy.sparse as sps
+import yaml
 
 # ---------------------------
 #   Graph Generator
@@ -61,7 +65,7 @@ class GraphGenerator:
         G = nx.convert_node_labels_to_integers(G, ordering='sorted')
         return G
 
-    def nx_to_dgl(self, G: nx.Graph, edge_feat_dim: int = 0) -> dgl.DGLGraph:
+    def nx_to_dgl(self, G: nx.Graph) -> dgl.DGLGraph:
         """
         将NetworkX图转换为DGL图，并基于节点局部结构构造特征：
         - 度 (degree)
@@ -87,8 +91,8 @@ class GraphGenerator:
             triangles
         ]).T  # shape = (N, 4)
 
-        # 归一化（每列特征数值范围差距较大）
-        scaler = StandardScaler()
+        # 归一化（每列特征数值范围较大）
+        scaler = MinMaxScaler()
         node_features = scaler.fit_transform(node_features)
 
         g.ndata['feat'] = torch.tensor(node_features, dtype=torch.float32)
@@ -113,7 +117,7 @@ class GraphGenerator:
         labels = np.random.randint(0, num_classes, size=n)
         src, dst = g.edges()
         src = src.numpy(); dst = dst.numpy()
-        import scipy.sparse as sps
+        
         adj = sps.csr_matrix((np.ones(len(src)), (src, dst)), shape=(n, n))
         adj = adj + adj.T
         adj.data = np.minimum(adj.data, 1); adj.eliminate_zeros()
@@ -165,130 +169,131 @@ class GraphGenerator:
 
         else:
             raise ValueError("task must be 'node' or 'edge'")
-    def to_dist_graph(
-        self,
-        g: dgl.DGLGraph,
-        num_parts: int = 3,
-        graph_name: str = "demo",
-        out_dir: str = "./parted_graph",
-        balance_edges: bool = True,
-        partition_method: str = "metis",  # 可选 "metis" 或 "random"
-    ) -> dgl.distributed.DistGraph:
+
+    # ---------------------------
+    # 4. 数据划分
+    # ---------------------------
+    def split_data(self, g: dgl.DGLGraph, train_ratio: float = 0.7, val_ratio: float = 0.15):
+        n = g.num_nodes()
+        idx = np.random.permutation(n)
+        n_train = int(train_ratio * n)
+        n_val = int(val_ratio * n)
+        train_idx = idx[:n_train]
+        val_idx = idx[n_train:n_train + n_val]
+        test_idx = idx[n_train + n_val:]
+        return {'train': train_idx, 'val': val_idx, 'test': test_idx}
+
+    def partition_graph_for_node_classification(self, g: dgl.DGLGraph, num_parts: int = 4, method: str = 'metis',
+                        output_dir: str = './partitions'):
         """
-        将DGL图划分为分布式图。
-
-        参数:
-        - g (dgl.DGLGraph): 输入的DGL图。
-        - num_parts (int): 划分的子图数量。
-        - graph_name (str): 图的名称。
-        - out_dir (str): 输出目录。
-        - balance_edges (bool): 是否平衡边。
-        - partition_method (str): 划分方法 ('metis' 或 'random')。
-
-        返回:
-        - dgl.distributed.DistGraph: 分布式图。
+        对DGL图进行划分。
+        method: 'metis' 或 'random'
         """
+        os.makedirs(output_dir, exist_ok=True)
+        # parts {part_id: subgraph} 
+        parts = {}
+        if method == 'metis':
+            raw_parts = dgl.metis_partition(g, num_parts)
 
-        if os.path.exists(out_dir):
-            shutil.rmtree(out_dir)
-        os.makedirs(out_dir, exist_ok=True)
+            for pid, subg in raw_parts.items():
+                # 原图节点 ID
+                orig_nids = subg.ndata[dgl.NID]
 
-        # 划分图
-        print(f"Partitioning graph into {num_parts} parts using '{partition_method}' method...")
+                # 拷贝节点特征
+                if 'feat' in g.ndata:
+                    subg.ndata['feat'] = g.ndata['feat'][orig_nids]
+                if 'labels' in g.ndata:
+                    subg.ndata['labels'] = g.ndata['labels'][orig_nids]
 
-        dgl.distributed.partition_graph(
-            graph=g,
-            graph_name=graph_name,
-            num_parts=num_parts,
-            out_path=out_dir,
-            balance_edges=balance_edges,
-            part_method=partition_method  # 指定划分方式
+                # 保存映射关系
+                subg.ndata['orig_id'] = orig_nids
+                parts[pid] = subg
+        elif method == 'random':
+            # -----------------------------
+            # 自定义随机划分逻辑
+            # -----------------------------
+            n = g.num_nodes()
+            node_parts = np.random.randint(0, num_parts, size=n)
+
+            src, dst = g.edges()
+            src, dst = src.numpy(), dst.numpy()
+
+            for pid in range(num_parts):
+                # 当前分区的节点集合
+                part_nodes = np.where(node_parts == pid)[0]
+
+                # 筛选两端都属于该分区的边
+                mask = np.isin(src, part_nodes) & np.isin(dst, part_nodes)
+                part_src, part_dst = src[mask], dst[mask]
+
+                # 建立旧 -> 新节点映射
+                old2new = {nid: i for i, nid in enumerate(part_nodes)}
+                mapped_src = np.array([old2new[s] for s in part_src])
+                mapped_dst = np.array([old2new[d] for d in part_dst])
+
+                # 构建子图
+                subg = dgl.graph((mapped_src, mapped_dst))
+                subg.ndata['feat'] = g.ndata['feat'][part_nodes]
+                if 'labels' in g.ndata:
+                    subg.ndata['labels'] = g.ndata['labels'][part_nodes]
+                subg.ndata['orig_id'] = torch.tensor(part_nodes)
+
+                parts[pid] = subg
+        else:
+            raise ValueError(f"Unknown partition method: {method}")
+
+        for pid, subg in parts.items():
+            dgl.save_graphs(os.path.join(output_dir, f'graph_part{pid}_{method}.dgl'), [subg])
+
+        print(str(method), parts)
+
+        print(f"Graph successfully partitioned into {num_parts} parts ({method}) at {output_dir}")
+    def get_dataloader_for_node_classification(self, pid, partition_method, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions', batch_size: int = 32):
+        """
+        加载指定pid对应的子图并为子图创建 DataLoader
+        """
+        path = os.path.join(partition_dir, f'graph_part{pid}_{partition_method}.dgl')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Subgraph {path} not found.")
+
+        subg, _ = dgl.load_graphs(path)
+        subg = subg[0]
+
+        # Node sampler: 随机邻居采样 (层数 = fanout 数量)
+        sampler = dgl.dataloading.NeighborSampler(sampler_fanouts)
+
+        # 节点索引
+        node_ids = torch.arange(subg.num_nodes())
+
+        # 创建 DGL 的 DataLoader
+        dataloader = dgl.dataloading.DataLoader(
+            subg,
+            node_ids,
+            sampler,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=num_workers,
+            device=device
         )
 
-        # 加载 DistGraph
-        part_config = os.path.join(out_dir, f"{graph_name}.json")
-        dist_g = dgl.distributed.DistGraph(graph_name, part_config=part_config)
-        print(f"DistGraph loaded successfully from {part_config}")
-        return dist_g
-
-# ---------------------------
-#  分布式节点分类加载器
-# ---------------------------
-def get_dist_node_dataloader(g: dgl.DGLGraph, split_dict: Dict[str, np.ndarray],
-                             batch_size: int = 1024, num_workers: int = 0, shuffle: bool = True,
-                             sampler: str = 'neighbor', fanouts: List[int] = [10, 10]) -> tuple:
-    """
-    获取分布式节点分类任务的数据加载器。
-
-    参数:
-    - g (dgl.DGLGraph): 输入的DGL图。
-    - split_dict (Dict[str, np.ndarray]): 数据集划分字典。
-    - batch_size (int): 批量大小。
-    - num_workers (int): 工作线程数。
-    - shuffle (bool): 是否打乱数据。
-    - sampler (str): 采样器类型。
-    - fanouts (List[int]): 每层的采样数量。
-
-    返回:
-    - tuple: 包含训练、验证和测试数据加载器的元组。
-    """
-    from dgl.dataloading import DistNodeDataLoader, MultiLayerNeighborSampler
-    if sampler == 'neighbor':
-        sampler = MultiLayerNeighborSampler(fanouts)
-    else:
-        raise ValueError("Unsupported sampler")
-    train_loader = DistNodeDataLoader(g, train_idx, sampler, batch_size=batch_size, shuffle=shuffle, drop_last=False, num_workers=num_workers)
-    val_loader = DistNodeDataLoader(g, val_idx, sampler, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
-    test_loader = DistNodeDataLoader(g, test_idx, sampler, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
-    return train_loader, val_loader, test_loader
+        return dataloader, subg
 
 
-# ---------------------------
-#  分布式链路预测加载器
-# ---------------------------
-def get_dist_edge_dataloader(g: dgl.DGLGraph, split_dict: Dict[str, np.ndarray],
-                             batch_size: int = 1024, num_workers: int = 0,
-                             sampler: str = 'neighbor', fanouts: List[int] = [10, 10]) -> tuple:
-    """
-    获取分布式链路预测任务的数据加载器。
+if __name__ == "__main__":
+    gen = GraphGenerator()
+    G_nx = gen.generate_nx_graph(kind='ER', n_nodes=2000, p=0.01)
+    g = gen.nx_to_dgl(G_nx)
+    gen.add_node_labels(g)
 
-    参数:
-    - g (dgl.DGLGraph): 输入的DGL图。
-    - split_dict (Dict[str, np.ndarray]): 数据集划分字典。
-    - batch_size (int): 批量大小。
-    - num_workers (int): 工作线程数。
-    - sampler (str): 采样器类型。
-    - fanouts (List[int]): 每层的采样数量。
+    # 划分为4个子图（metis）
+    gen.partition_graph_for_node_classification(g, num_parts=3, method='metis', output_dir='./tmp/graph_parts')
+    gen.partition_graph_for_node_classification(g, num_parts=3, method='random', output_dir='./tmp/graph_parts')
 
-    返回:
-    - tuple: 包含训练、验证和测试数据加载器的元组。
-    """
-    from dgl.dataloading import DistEdgeDataLoader, MultiLayerNeighborSampler
-    if sampler == 'neighbor':
-        sampler = MultiLayerNeighborSampler(fanouts)
-    else:
-        raise ValueError("Unsupported sampler")
-    train_loader = DistEdgeDataLoader(g, split_dict['train'], sampler, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=num_workers)
-    val_loader = DistEdgeDataLoader(g, split_dict['val'], sampler, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
-    test_loader = DistEdgeDataLoader(g, split_dict['test'], sampler, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers)
-    return train_loader, val_loader, test_loader
-
-
-if __name__ == '__main__':
-    gen = GraphGenerator(seed=123)
-    G_nx = gen.generate_nx_graph(kind='SBM', sbm_sizes=[500, 500, 500, 500], sbm_p_in=0.08, sbm_p_out=0.005)
-    g = gen.nx_to_dgl(G_nx, node_feat_dim=32, edge_feat_dim=8)
-    gen.add_node_labels(g, num_classes=8, homophily=0.7)
-
-    print("Graph generated:", g)
-
-    # 划分训练/验证/测试集
-    split_dict = gen.split_data(g, task='node')
-
-    # 生成 DistGraph，支持跨 GPU 特征聚合
-    dist_g = gen.to_dist_graph(g, num_parts=3, partition_method="metis")
-
-    # 获取 DistDataLoader，可搭配 Pytorch DDP框架实现单机多卡的多进程分布式训练
-    train_loader, val_loader, test_loader = get_dist_node_dataloader(dist_g, split_dict)
-
-    print("Batch Data:", next(iter(train_loader)))
+    loader, _ = gen.get_dataloader_for_node_classification(pid=0, partition_method='metis', partition_dir='./tmp/graph_parts')
+    
+    for input_nodes, output_nodes, blocks in loader:
+        print("Input nodes:", input_nodes)
+        print("Output nodes:", output_nodes)
+        print("Blocks:", blocks)
+        break  # 只看第一个 batch
