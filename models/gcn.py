@@ -29,6 +29,7 @@ class GCN(nn.Module):
         
         h = self.conv2(g, h)
         
+        
         return h
     
     def compute_loss(self, logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
