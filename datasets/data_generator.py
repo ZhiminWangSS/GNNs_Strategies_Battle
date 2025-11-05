@@ -4,7 +4,8 @@ import torch
 import dgl
 from typing import Optional, List, Dict
 import random
-import os, shutil
+import os
+import shutil
 from sklearn.preprocessing import MinMaxScaler
 import dgl.distributed as dist_dgl
 import multiprocessing
@@ -14,6 +15,8 @@ import yaml
 # ---------------------------
 #   Graph Generator
 # ---------------------------
+
+
 class GraphGenerator:
     def __init__(self, seed: Optional[int] = 42):
         """
@@ -34,14 +37,19 @@ class GraphGenerator:
         生成NetworkX图。
 
         参数:
-        - kind (str): 图的类型 ('ER', 'BA', 'SBM')。
+        - kind (str): 图的生成模式 ('ER', 'BA', 'SBM')。
+        - seed (Optional[int]): 随机种子，确保图可复现。
+        for ER and BA
         - n_nodes (int): 节点数量。
-        - p (float): ER图的边生成概率。
+        for ER
+            - p (float): ER图的边生成概率。
+        for BA
         - m (int): BA图的每个新节点连接的边数。
+        for SBM
         - sbm_sizes (Optional[List[int]]): SBM图的社区大小列表。
         - sbm_p_in (float): SBM图社区内边的生成概率。
-        - sbm_p_out (float): SBM图社区间边的生成概率。
-        - seed (Optional[int]): 随机种子。
+        - sbm_p_out (float): SBM图社区间边的生成概率
+
 
         返回:
         - nx.Graph: 生成的NetworkX图。
@@ -56,7 +64,8 @@ class GraphGenerator:
             if sbm_sizes is None:
                 raise ValueError("SBM requires sbm_sizes")
             k = len(sbm_sizes)
-            p_matrix = [[sbm_p_in if i==j else sbm_p_out for j in range(k)] for i in range(k)]
+            p_matrix = [
+                [sbm_p_in if i == j else sbm_p_out for j in range(k)] for i in range(k)]
             G = nx.stochastic_block_model(sbm_sizes, p_matrix, seed=seed)
             G = nx.Graph(G)
             G.remove_edges_from(nx.selfloop_edges(G))
@@ -116,15 +125,18 @@ class GraphGenerator:
         n = g.num_nodes()
         labels = np.random.randint(0, num_classes, size=n)
         src, dst = g.edges()
-        src = src.numpy(); dst = dst.numpy()
-        
+        src = src.numpy()
+        dst = dst.numpy()
+
         adj = sps.csr_matrix((np.ones(len(src)), (src, dst)), shape=(n, n))
         adj = adj + adj.T
-        adj.data = np.minimum(adj.data, 1); adj.eliminate_zeros()
+        adj.data = np.minimum(adj.data, 1)
+        adj.eliminate_zeros()
         for _ in range(2):
             for u in range(n):
                 neigh = adj[u].indices
-                if len(neigh) == 0: continue
+                if len(neigh) == 0:
+                    continue
                 if np.random.rand() < homophily:
                     neigh_labels = labels[neigh]
                     labels[u] = int(np.bincount(neigh_labels).argmax())
@@ -132,65 +144,14 @@ class GraphGenerator:
                     labels[u] = np.random.randint(0, num_classes)
         g.ndata[label_key] = torch.from_numpy(labels).long()
 
-    def split_data(self, g: dgl.DGLGraph, task: str = 'node', train_ratio: float = 0.7, val_ratio: float = 0.15) -> Dict[str, np.ndarray]:
-        """
-        划分训练/验证/测试集。
-
-        参数:
-        - g (dgl.DGLGraph): 输入的DGL图。
-        - task (str): 任务类型 ('node' 或 'edge')。
-        - train_ratio (float): 训练集比例。
-        - val_ratio (float): 验证集比例。
-
-        返回:
-        - Dict[str, np.ndarray]: 包含训练、验证和测试集索引的字典。
-        """
-        np.random.seed(self.seed)
-
-        if task == 'node':
-            n = g.num_nodes()
-            idx = np.random.permutation(n)
-            n_train = int(train_ratio * n)
-            n_val = int(val_ratio * n)
-            train_idx = idx[:n_train]
-            val_idx = idx[n_train:n_train + n_val]
-            test_idx = idx[n_train + n_val:]
-            return {'train': train_idx, 'val': val_idx, 'test': test_idx}
-
-        elif task == 'edge':
-            e = g.num_edges()
-            idx = np.random.permutation(e)
-            n_train = int(train_ratio * e)
-            n_val = int(val_ratio * e)
-            train_idx = idx[:n_train]
-            val_idx = idx[n_train:n_train + n_val]
-            test_idx = idx[n_train + n_val:]
-            return {'train': train_idx, 'val': val_idx, 'test': test_idx}
-
-        else:
-            raise ValueError("task must be 'node' or 'edge'")
-
-    # ---------------------------
-    # 4. 数据划分
-    # ---------------------------
-    def split_data(self, g: dgl.DGLGraph, train_ratio: float = 0.7, val_ratio: float = 0.15):
-        n = g.num_nodes()
-        idx = np.random.permutation(n)
-        n_train = int(train_ratio * n)
-        n_val = int(val_ratio * n)
-        train_idx = idx[:n_train]
-        val_idx = idx[n_train:n_train + n_val]
-        test_idx = idx[n_train + n_val:]
-        return {'train': train_idx, 'val': val_idx, 'test': test_idx}
-
-    def partition_graph_for_node_classification(self, g: dgl.DGLGraph, num_parts: int = 4, method: str = 'metis',
+    def partition_graph(self, g: dgl.DGLGraph, num_parts: int = 4, method: str = 'metis',
                         output_dir: str = './partitions'):
         """
         对DGL图进行划分。
         method: 'metis' 或 'random'
         """
         os.makedirs(output_dir, exist_ok=True)
-        # parts {part_id: subgraph} 
+        # parts {part_id: subgraph}
         parts = {}
         if method == 'metis':
             raw_parts = dgl.metis_partition(g, num_parts)
@@ -243,17 +204,20 @@ class GraphGenerator:
             raise ValueError(f"Unknown partition method: {method}")
 
         for pid, subg in parts.items():
-            dgl.save_graphs(os.path.join(output_dir, f'graph_part{pid}_{method}.dgl'), [subg])
+            dgl.save_graphs(os.path.join(
+                output_dir, f'graph_part{pid}_{method}.dgl'), [subg])
 
         print(str(method), parts)
 
-        print(f"Graph successfully partitioned into {num_parts} parts ({method}) at {output_dir}")
-        
-    def get_dataloader_for_node_classification(self, pid, partition_method, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions', batch_size: int = 32):
+        print(
+            f"Graph successfully partitioned into {num_parts} parts ({method}) at {output_dir}")
+
+    def get_dataloader_for_node_classification(self, pid, partition_method, batch_size: int = 32, train_ratio=0.8, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions'):
         """
-        加载指定pid对应的子图并为子图创建 DataLoader
+        加载指定pid对应的子图并为子图创建适合于node classification任务的DataLoader
         """
-        path = os.path.join(partition_dir, f'graph_part{pid}_{partition_method}.dgl')
+        path = os.path.join(
+            partition_dir, f'graph_part{pid}_{partition_method}.dgl')
         if not os.path.exists(path):
             raise FileNotFoundError(f"Subgraph {path} not found.")
 
@@ -263,13 +227,19 @@ class GraphGenerator:
         # Node sampler: 随机邻居采样 (层数 = fanout 数量)
         sampler = dgl.dataloading.NeighborSampler(sampler_fanouts)
 
-        # 节点索引
-        node_ids = torch.arange(subg.num_nodes())
+        # 全部节点索引
+        all_nodes = torch.arange(subg.num_nodes())
+        num_train = int(len(all_nodes) * train_ratio)
 
-        # 创建 DGL 的 DataLoader
-        dataloader = dgl.dataloading.DataLoader(
+        # 随机划分
+        perm = torch.randperm(len(all_nodes))
+        train_nodes = all_nodes[perm[:num_train]]
+        test_nodes = all_nodes[perm[num_train:]]
+
+        # 构建训练 DataLoader
+        train_loader = dgl.dataloading.DataLoader(
             subg,
-            node_ids,
+            train_nodes,
             sampler,
             batch_size=batch_size,
             shuffle=True,
@@ -278,23 +248,193 @@ class GraphGenerator:
             device=device
         )
 
-        return dataloader, subg
+        # 构建测试 DataLoader
+        test_loader = dgl.dataloading.DataLoader(
+            subg,
+            test_nodes,
+            sampler,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            device=device
+        )
+
+        print(
+            f"Subgraph {pid} -> {len(train_nodes)} train nodes, {len(test_nodes)} test nodes")
+
+        return train_loader, test_loader, subg
+
+    def get_dataloader_for_link_prediction(self, pid, partition_method, batch_size: int = 32, train_ratio=0.8, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions'):
+        """
+        加载指定pid对应的子图并为子图创建适合于link prediction任务的DataLoader。
+
+        参数:
+        - pid (int): 分区ID。
+        - partition_method (str): 分区方法 ('metis' 或 'random')。
+        - batch_size (int): 批量大小。
+        - train_ratio (float): 训练集比例。
+        - num_workers (int): DataLoader的工作线程数。
+        - device (torch.device): 设备 (如 'cuda')。
+        - sampler_fanouts (List[int]): 每层的采样数量。
+        - partition_dir (str): 分区文件的目录。
+
+        返回:
+        - train_loader: 训练集的DataLoader。
+        - test_loader: 测试集的DataLoader。
+        - subg: 当前分区的子图。
+        """
+        path = os.path.join(
+            partition_dir, f'graph_part{pid}_{partition_method}.dgl')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Subgraph {path} not found.")
+
+        subg, _ = dgl.load_graphs(path)
+        subg = subg[0]
+
+        # Edge sampler: 随机邻居采样 (层数 = fanout 数量)
+        neg_sampler = dgl.dataloading.negative_sampler.Uniform(2)
+        sampler = dgl.dataloading.as_edge_prediction_sampler(
+            dgl.dataloading.NeighborSampler(sampler_fanouts), negative_sampler=neg_sampler)
+
+        # 全部边索引
+        all_edges = torch.arange(subg.num_edges())
+        num_train = int(len(all_edges) * train_ratio)
+
+        # 随机划分
+        perm = torch.randperm(len(all_edges))
+        train_edges = all_edges[perm[:num_train]]
+        test_edges = all_edges[perm[num_train:]]
+
+        # 构建训练 DataLoader
+        train_loader = dgl.dataloading.DataLoader(
+            subg,
+            train_edges,
+            sampler,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=num_workers,
+            device=device
+        )
+
+        # 构建测试 DataLoader
+        test_loader = dgl.dataloading.DataLoader(
+            subg,
+            test_edges,
+            sampler,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            device=device
+        )
+
+        print(
+            f"Subgraph {pid} -> {len(train_edges)} train edges, {len(test_edges)} test edges")
+
+        return train_loader, test_loader, subg
 
 
 if __name__ == "__main__":
-    gen = GraphGenerator()
-    G_nx = gen.generate_nx_graph(kind='ER', n_nodes=2000, p=0.01)
+    task = 'node_classification'
+    batch_size = 8
+    device = torch.device("cpu")
+    seed = 123
+    n_nodes = 2000
+    p = 0.01
+
+    gen = GraphGenerator(seed=123)
+    G_nx = gen.generate_nx_graph(kind='ER', n_nodes=2000, p=0.01) # 生成可控图
     g = gen.nx_to_dgl(G_nx)
-    gen.add_node_labels(g)
+    if task == 'node_classification':
+        gen.add_node_labels(g)
 
-    # 划分为4个子图（metis）
-    gen.partition_graph_for_node_classification(g, num_parts=3, method='metis', output_dir='./tmp/graph_parts')
-    gen.partition_graph_for_node_classification(g, num_parts=3, method='random', output_dir='./tmp/graph_parts')
+        # 划分为 num_parts 个子图
+        gen.partition_graph(g, num_parts=3, method='metis',
+                            output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
+        gen.partition_graph(g, num_parts=3, method='random',
+                            output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
 
-    loader, _ = gen.get_dataloader_for_node_classification(pid=0, partition_method='metis', partition_dir='./tmp/graph_parts')
-    
-    for input_nodes, output_nodes, blocks in loader:
-        print("Input nodes:", input_nodes)
-        print("Output nodes:", output_nodes)
-        print("Blocks:", blocks)
-        break  # 只看第一个 batch
+        train_loader, test_loader, _ = gen.get_dataloader_for_node_classification(
+            pid=0, partition_method='random', partition_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts', batch_size=batch_size, device=device)
+
+        for input_nodes, output_nodes, blocks in train_loader:
+            # -----------------------------------
+            # input_nodes: 当前 batch 所需的源节点ID
+            # 这些节点会被送入 GNN，用于消息传递计算
+            print("Input nodes:", input_nodes)
+
+            # -----------------------------------
+            # output_nodes: 当前 batch 的目标节点ID
+            # 通常对应 GNN 需要计算表示的节点集合（destination nodes）
+            print("Output nodes:", output_nodes)
+
+            # -----------------------------------
+            # blocks: message flow graph (MFG) 的列表
+            # blocks[i] 对应 GNN 的第 i 层
+            # 每个 block 包含 src/dst 节点及它们的特征
+            # srcdata['feat']: 源节点特征，用于前向计算
+            # dstdata['labels']: 目标节点标签（如果有的话）
+            print("Blocks:", 
+                blocks[0].srcdata['feat'],  # 第一层 block 的源节点特征
+                blocks[0].dstdata['labels']  # 第一层 block 的目标节点标签
+                )
+
+            # -----------------------------------
+            # break: 只查看第一个 batch，避免打印过多信息
+            break
+
+    elif task == 'link_prediction':
+
+        # 划分为 num_parts 个子图
+        gen.partition_graph(g, num_parts=3, method='metis',
+                            output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
+        gen.partition_graph(g, num_parts=3, method='random',
+                            output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
+
+        train_loader, test_loader, _ = gen.get_dataloader_for_link_prediction(
+            pid=0, partition_method='random', partition_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts', batch_size=batch_size, device=device)
+
+        for input_nodes, pos_pair_graph, neg_pair_graph, blocks in train_loader:
+            # -----------------------------
+            # input_nodes: 本 batch 所需的源节点，用于计算消息传递
+            # shape: [num_src_nodes] 或 dict（异构图）
+            print("Input nodes:", input_nodes)
+
+            # -----------------------------
+            # pos_pair_graph: 本 batch 的正边 subgraph，用于链路预测
+            # 包含 src/dst 节点和正边信息（通常保留了 edge label）
+            # 可以通过 pos_pair_graph.edges() 获取边索引
+            print("Positive pair graph:")
+            print("  src nodes:", pos_pair_graph.srcdata[dgl.NID])
+            print("  dst nodes:", pos_pair_graph.dstdata[dgl.NID])
+            print("  edges:", pos_pair_graph.edges())
+            if 'label' in pos_pair_graph.edata:
+                print("  edge labels:", pos_pair_graph.edata['label'])
+
+            # -----------------------------
+            # neg_pair_graph: 本 batch 的负边 subgraph，用于链路预测
+            # 和 pos_pair_graph 结构相同，但边是负样本
+            print("Negative pair graph:")
+            print("  src nodes:", neg_pair_graph.srcdata[dgl.NID])
+            print("  dst nodes:", neg_pair_graph.dstdata[dgl.NID])
+            print("  edges:", neg_pair_graph.edges())
+            if 'label' in neg_pair_graph.edata:
+                print("  edge labels:", neg_pair_graph.edata['label'])
+
+            # -----------------------------
+            # blocks: 用于节点表示计算的 message flow graph (MFG)
+            # blocks 是一个 list，每层的 block 对应 GNN 的一层
+            # src/dst 是本层计算所需的节点
+            print("Blocks:")
+            for i, block in enumerate(blocks):
+                print(f"  Block {i}:")
+                print("    src nodes:", block.srcdata[dgl.NID])
+                print("    dst nodes:", block.dstdata[dgl.NID])
+                print("    src features:", block.srcdata['feat'].shape)
+                print("    dst labels:", block.dstdata.get(
+                    'labels', 'No labels in block')) # 链路预测没有节点标签
+                break  # 只看第一个 block
+
+            break  # 只查看第一个 batch
