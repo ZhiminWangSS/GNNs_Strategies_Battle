@@ -1,6 +1,6 @@
 # GNN Parallel Strategies Battle
 
-Compare different parallel training strategies (GDP, NFP, SNP, DNP) for Graph Neural Networks on OGBN-arxiv and OGBL-ddi datasets.
+Compare different graph partitioning for graphs with differnt properties in terms of computational overhead and performance.
 
 ## Setup
 
@@ -25,47 +25,8 @@ python datasets/data_generator.py
 ## Project Structure	
 
 ```
-├── dataset_generator # generator.py # linjia
-├── models/           # GCN model.py
-├── training/       # sampling strategies for train and test 
-├── metrics/          # Training metrics (communication, convergence)
+├── datasets          # data_generator.py # linjia
+├── models/           # gcn.py
+├── training/         # scripts for parallel training
+├── metrics/          # metrics
 ```
-
-
-
-### Stage 1 Infrastructure construction
-
-- model: GCN
-- dataset:
-  - OGBN-arxiv [link](https://ogb.stanford.edu/docs/nodeprop/#ogbn-arxiv)
-  - OGBL-ddi [link](https://ogb.stanford.edu/docs/linkprop/#ogbl-ddi)
-- distributed strategy:
-  - GDP
-  - NFP
-  - SNP
-  - DNP
-- metrics: 
-  - Communication Overhead
-    - Average epoch time; GPU communication time; Communication Ratio
-  - Computational Overhead
-    - Maximum memory usage, GPU utilization ratio
-  - Convergence
-    - Number of epochs to convergence, Loss curve
-  - Performance
-    - Accuracy, ROC-AUC
-
-
-
-### Stage 2 Training and analysis
-
-- distributed strategy:
-  - GDP
-  - NFP
-  - SNP
-  - DNP
-- GPU nums:
-  - 1
-  - 2
-  - 4
-
-total 4 * 3 = 12 training  and be divided to 4 people
