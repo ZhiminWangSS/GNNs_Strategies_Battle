@@ -148,7 +148,7 @@ class GraphGenerator:
                         output_dir: str = './partitions'):
         """
         对DGL图进行划分。
-        method: 'metis' 或 'random'
+        method: 'metis', 'random' and 'direct'
         """
         os.makedirs(output_dir, exist_ok=True)
         # parts {part_id: subgraph}
@@ -171,7 +171,7 @@ class GraphGenerator:
                 parts[pid] = subg
         elif method == 'random':
             # -----------------------------
-            # 自定义随机划分逻辑
+            # 随机划分
             # -----------------------------
             n = g.num_nodes()
             node_parts = np.random.randint(0, num_parts, size=n)
@@ -199,6 +199,29 @@ class GraphGenerator:
                     subg.ndata['labels'] = g.ndata['labels'][part_nodes]
                 subg.ndata['orig_id'] = torch.tensor(part_nodes)
 
+                parts[pid] = subg
+        elif method == 'direct':
+            n = g.num_nodes()
+            nodes_per_part = n // num_parts
+            all_nodes = np.arange(n)
+            for pid in range(num_parts):
+                if pid == num_parts - 1:
+                    part_nodes = all_nodes[pid * nodes_per_part:]  # 最后一部分包含剩余节点
+                else:
+                    part_nodes = all_nodes[pid * nodes_per_part:(pid + 1) * nodes_per_part]
+
+                src, dst = g.edges()
+                src, dst = src.numpy(), dst.numpy()
+                mask = np.isin(src, part_nodes) & np.isin(dst, part_nodes)
+                part_src, part_dst = src[mask], dst[mask]
+                old2new = {nid: i for i, nid in enumerate(part_nodes)}
+                mapped_src = np.array([old2new[s] for s in part_src])
+                mapped_dst = np.array([old2new[d] for d in part_dst])
+                subg = dgl.graph((mapped_src, mapped_dst))
+                subg.ndata['feat'] = g.ndata['feat'][part_nodes]
+                if 'labels' in g.ndata:
+                    subg.ndata['labels'] = g.ndata['labels'][part_nodes]
+                subg.ndata['orig_id'] = torch.tensor(part_nodes)
                 parts[pid] = subg
         else:
             raise ValueError(f"Unknown partition method: {method}")
@@ -355,6 +378,8 @@ if __name__ == "__main__":
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
         gen.partition_graph(g, num_parts=3, method='random',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
+        gen.partition_graph(g, num_parts=3, method='direct',
+                            output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
 
         train_loader, test_loader, _ = gen.get_dataloader_for_node_classification(
             pid=0, partition_method='random', partition_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts', batch_size=batch_size, device=device)
@@ -391,6 +416,8 @@ if __name__ == "__main__":
         gen.partition_graph(g, num_parts=3, method='metis',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
         gen.partition_graph(g, num_parts=3, method='random',
+                            output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
+        gen.partition_graph(g, num_parts=3, method='direct',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
 
         train_loader, test_loader, _ = gen.get_dataloader_for_link_prediction(

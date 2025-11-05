@@ -1,4 +1,4 @@
-# GNN Parallel Strategies Battle
+# Partition Strategies Battle
 
 Compare different graph partitioning for graphs with differnt properties in terms of computational overhead and performance.
 
@@ -13,7 +13,7 @@ pip install scikit-learn
 
 ## Graph Generator
 - Supports three types of graphs: **ER**, **BA**, and **SBM**, with hyperparameters to control structural properties.  
-- Supports two partitioning methods: **Metis** and **Random**. It is recommended to save the partitioned graphs in a `tmp` folder.
+- Supports two partitioning methods: **Metis**, **Random** and **Direct**. It is recommended to save the partitioned graphs in a `tmp` folder.
 - Provides DataLoaders for specified subgraphs, ready for **node classification** and **link prediction** tasks. Recommended to initialize one DataLoader per process, and make sure `GPU num = subgraph num = process num`.
 
 ### Run an example
