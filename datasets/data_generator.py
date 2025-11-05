@@ -340,10 +340,11 @@ if __name__ == "__main__":
     task = 'node_classification'
     batch_size = 8
     device = torch.device("cpu")
-    n_nodes=2000
-    p=0.01
+    seed = 123
+    n_nodes = 2000
+    p = 0.01
 
-    gen = GraphGenerator()
+    gen = GraphGenerator(seed=123)
     G_nx = gen.generate_nx_graph(kind='ER', n_nodes=2000, p=0.01) # 生成可控图
     g = gen.nx_to_dgl(G_nx)
     if task == 'node_classification':
