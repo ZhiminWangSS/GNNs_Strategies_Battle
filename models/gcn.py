@@ -21,6 +21,8 @@ class GCN(nn.Module):
     
     def forward(self, g: dgl.DGLGraph, features: torch.Tensor) -> torch.Tensor:
         
+        # 对于边预测任务，features是拼接的节点特征
+        # 需要确保图结构和特征维度匹配
         h = self.conv1(g, features)
         h = torch.relu(h)
         

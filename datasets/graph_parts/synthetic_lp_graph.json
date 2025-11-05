@@ -1,0 +1,30 @@
+{
+  "graph_name": "synthetic_lp_graph",
+  "part_method": "metis",
+  "num_parts": 3,
+  "num_nodes": 10000,
+  "num_edges": 50000,
+  "node_map": {
+    "type": "range",
+    "range": [0, 10000]
+  },
+  "edge_map": {
+    "type": "range", 
+    "range": [0, 50000]
+  },
+  "part-0": {
+    "node_feats": "graph_part0_metis.dgl",
+    "edge_feats": "graph_part0_metis.dgl",
+    "part_id": 0
+  },
+  "part-1": {
+    "node_feats": "graph_part1_metis.dgl",
+    "edge_feats": "graph_part1_metis.dgl",
+    "part_id": 1
+  },
+  "part-2": {
+    "node_feats": "graph_part2_metis.dgl",
+    "edge_feats": "graph_part2_metis.dgl",
+    "part_id": 2
+  }
+}

@@ -248,6 +248,7 @@ class GraphGenerator:
         print(str(method), parts)
 
         print(f"Graph successfully partitioned into {num_parts} parts ({method}) at {output_dir}")
+        
     def get_dataloader_for_node_classification(self, pid, partition_method, num_workers=1, device=torch.device("cuda"), sampler_fanouts=[10, 10, 5], partition_dir: str = './partitions', batch_size: int = 32):
         """
         加载指定pid对应的子图并为子图创建 DataLoader
