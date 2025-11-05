@@ -4,32 +4,30 @@ Compare different parallel training strategies (GDP, NFP, SNP, DNP) for Graph Ne
 
 ## Setup
 
-**Prerequisites:**
-- Python 3.11
-- [uv](https://github.com/astral-sh/uv) - Install with: `pip install uv`
-
-**Tested on Linux**
-
 ```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install  dgl -f https://data.dgl.ai/wheels/torch-2.2/cu121/repo.html # change bases on your cuda verison
-uv sync
+conda create -n dgl_torch python=3.12.1 -y
+pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+pip install  dgl -f https://data.dgl.ai/wheels/torch-2.3/cu121/repo.html
+pip install scikit-learn
 ```
 
-## Run Example
+## Graph Generator
+- Supports three types of graphs: **ER**, **BA**, and **SBM**, with hyperparameters to control structural properties.  
+- Supports two partitioning methods: **Metis** and **Random**. It is recommended to save the partitioned graphs in a `tmp` folder.
+- Provides DataLoaders for specified subgraphs, ready for **node classification** and **link prediction** tasks. Recommended to initialize one DataLoader per process, and make sure `GPU num = subgraph num = process num`.
 
+### Run an example
 ```bash
-python gdp_example.py
+cd GNNs_Strategies_Battle
+python datasets/data_generator.py
 ```
 
 ## Project Structure	
 
 ```
-├── dataset_generator # generator.py #linjia
+├── dataset_generator # generator.py # linjia
 ├── models/           # GCN model.py
 ├── training/       # sampling strategies for train and test 
-	- partition 随机划分 (Random Partition) METIS 划分 (METIS Partition) 非均匀划分 (Non-Uniform Partition)
 ├── metrics/          # Training metrics (communication, convergence)
 ```
 
