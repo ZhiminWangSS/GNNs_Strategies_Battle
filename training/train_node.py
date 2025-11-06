@@ -87,10 +87,10 @@ def evaluate(model, test_loader, device, rank, world_size, subg):
 # ==========================================================
 # 4️⃣ 主训练函数
 # ==========================================================
-def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.001, partition_method="metis"):
+def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.001, partition_method="metis", kind='ER'):
     torch.manual_seed(0)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer = SummaryWriter(log_dir=f"runs/node_cls_rank{rank}_{timestamp}") if rank == 0 else None
+    writer = SummaryWriter(log_dir=f"runs/node_cls_rank{rank}_world_size{world_size}_{kind}_{partition_method}") if rank == 0 else None
 
     # 数据加载
     gen = GraphGenerator()
@@ -221,27 +221,41 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
 # ==========================================================
 # 5️⃣ 分布式入口
 # ==========================================================
-def train_fn(rank, world_size, graph_dir, num_epochs=50, lr=0.001):
+def train_fn(rank, world_size, graph_dir, partition_method, kind, num_epochs=50, lr=0.001):
     device = setup_distributed(rank, world_size)
-    train(rank, rank, world_size, device, graph_dir, num_epochs=num_epochs, lr=lr)
+    train(rank, rank, world_size, device, graph_dir, num_epochs=num_epochs, lr=lr, partition_method=partition_method,kind=kind)
     dist.destroy_process_group()
 
 
 # ==========================================================
 # 6️⃣ 图准备 + 启动
 # ==========================================================
-def prepare_graph(graph_dir="datasets/node_cls", num_parts=3, nodes=1000):
+def prepare_graph(graph_dir="datasets/node_cls", kind="ER", method="metis", num_parts=3, nodes=1000):
     if not os.path.exists(graph_dir):
         gen = GraphGenerator()
-        G_nx = gen.generate_nx_graph(kind="ER", n_nodes=nodes, p=0.01)
+        G_nx = gen.generate_nx_graph(kind=kind, n_nodes=nodes, p=0.01)
         g = gen.nx_to_dgl(G_nx)
         gen.add_node_labels(g)
-        gen.partition_graph(g, num_parts=num_parts, method="metis", output_dir=graph_dir)
+        gen.partition_graph(g, num_parts=num_parts, method=method, output_dir=graph_dir)
     return graph_dir
 
 
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--world_size", default=3, type=int, help="World_size = num_parts")
+    parser.add_argument("--graph_type", default="ER", type=str, help="Graph Type")
+    parser.add_argument("--partition_method", default="metis", type=str, help="partition_method",)
+    args, unknown = parser.parse_known_args()
+    return args
+
 if __name__ == "__main__":
-    world_size = 3
-    graph_dir = prepare_graph(graph_dir="datasets/node_cls_ER", num_parts=3, nodes=1000)
-    num_epochs = 50
-    mp.spawn(train_fn, args=(world_size, graph_dir), nprocs=world_size, join=True)
+    args = parse_args()
+    world_size = args.world_size
+    graph_dir = prepare_graph(graph_dir="datasets/node_cls_" + args.graph_type, 
+                              kind=args.graph_type,
+                              method=args.partition_method,
+                              num_parts=world_size, 
+                              nodes=1000)
+    num_epochs = 30
+    mp.spawn(train_fn, args=(world_size, graph_dir, args.partition_method, args.graph_type), nprocs=world_size, join=True)
