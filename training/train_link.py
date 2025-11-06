@@ -134,7 +134,7 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
     print(f"每个 epoch 需要迭代 {num_batches} 次")
     if rank == 0:
         print(f"📊 Rank {rank} 加载完成 dataloader（子图 {rank}）")
-
+    subg = subg.to(device)
     # 模型初始化
     input_dim = 4   # 关键参数: 输入特征维度
     hidden_dim = 64  # 关键参数: 隐藏层维度
@@ -160,6 +160,7 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
     
     # ============ 训练循环 ============
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()
         total_loss = 0.0
         total_accuracy = 0.0
         num_batches = 0
@@ -174,7 +175,8 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
                 comm_start_time = time.time()
 
                 # 1️⃣ 取出节点特征（输入层源节点）
-                feats = blocks[0].srcdata["feat"].to(device)
+                feats = subg.ndata['feat'][input_nodes].to(device)
+                # feats = blocks[0].srcdata["feat"].to(device)
 
                 # 2️⃣ 使用 blocks 做 GCN 前向编码（message passing）
                 # gnn 的 forward 需要 (blocks, feats)
@@ -282,19 +284,37 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
                   f"Accuracy: {avg_accuracy_tensor.item():.4f}, "
                   f"Time: {epoch_time:.2f}s")
 
-        # ============ 测试评估 ============
-        # 每 10 个 epoch 进行一次测试评估
-        if (epoch + 1) % 10 == 0:
-            test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
-            if rank == 0:
-                writer.add_scalar("Accuracy/test", test_accuracy, epoch)
-                print(f"Test Accuracy at epoch {epoch+1}: {test_accuracy:.4f}")
+        # # ============ 测试评估 ============
+        # # 每 10 个 epoch 进行一次测试评估
+        # if (epoch + 1) % 10 == 0:
+        #     test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
+        #     if rank == 0:
+        #         writer.add_scalar("Accuracy/test", test_accuracy, epoch)
+        #         print(f"Test Accuracy at epoch {epoch+1}: {test_accuracy:.4f}")
 
     # ============ 模型保存 ============
     # 保存模型（仅在 rank 0 进程保存）
     if rank == 0:
         torch.save(gnn.state_dict(), f"link_prediction_model_rank{rank}.pth")
         print(f"Model saved as link_prediction_model_rank{rank}.pth")
+
+    # ============ 最终测试评估 ============
+    # 在所有训练结束后进行完整的测试评估
+    final_test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
+    
+    # 收集所有进程的测试准确度
+    test_acc_tensor = torch.tensor(final_test_accuracy, device=device)
+    all_test_acc = [torch.zeros_like(test_acc_tensor) for _ in range(world_size)]
+    dist.all_gather(all_test_acc, test_acc_tensor)
+    
+    # 计算平均测试准确度
+    avg_test_accuracy = sum([acc.item() for acc in all_test_acc]) / world_size
+    
+    if rank == 0:
+        print(f"\n📊 最终测试结果:")
+        print(f"各进程测试准确度: {[acc.item() for acc in all_test_acc]}")
+        print(f"平均测试准确度: {avg_test_accuracy:.4f}")
+        writer.add_scalar("Accuracy/final_test", avg_test_accuracy, num_epochs)
 
     # 关闭 TensorBoard writer
     if rank == 0:
@@ -378,7 +398,7 @@ if __name__ == "__main__":
     - world_size: 分布式进程数量
     """
     # 关键参数: 图数据配置
-    graph_dir = prepare_graph(graph_dir="datasets/node_prediction_small_test", num_parts=3, nodes=200)
+    graph_dir = prepare_graph(graph_dir="datasets/link_prediction_ER", num_parts=3, nodes=1000)
     world_size = 3
     device = None
     

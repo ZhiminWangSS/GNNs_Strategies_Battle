@@ -40,7 +40,7 @@ def setup_distributed(rank, world_size):
     return device
 
 
-def train_fn(rank, world_size, graph_dir, num_epochs=10, lr=0.001):
+def train_fn(rank, world_size, graph_dir, num_epochs=200, lr=0.001):
     """分布式训练函数，由mp.spawn调用"""
     device = None
     try:
@@ -66,7 +66,7 @@ def prepare_graph(graph_dir="datasets/graph_parts", num_parts=3, nodes=20):
         print(f"🔧 生成新的图数据并划分...")
         os.makedirs(graph_dir, exist_ok=True)
         gen = GraphGenerator()
-        G_nx = gen.generate_nx_graph(kind='ER', n_nodes=nodes, p=0.01,)
+        G_nx = gen.generate_nx_graph(kind='ER', n_nodes=nodes, p=0.01,sbm_sizes=[1000,500,300,200])
         g = gen.nx_to_dgl(G_nx)
         gen.add_node_labels(g)
 
@@ -101,7 +101,7 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
         sampler_fanouts=[10, 5],
         partition_dir=graph_dir
     )
-
+    subg = subg.to(device)
     if rank == 0:
         print(f"📊 Rank {rank} 加载完成 dataloader（子图 {rank}）")
 
@@ -125,21 +125,23 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
 
         for input_nodes, output_nodes, blocks in train_loader:
             # 1️⃣ 获取节点特征和标签
-            feats = blocks[0].srcdata["feat"].to(device)
-            labels = blocks[-1].dstdata["labels"].to(device)  # 最后一层 block 的 dst 节点标签
+            # feats = blocks[0].srcdata["feat"].to(device)
+            # labels = blocks[-1].dstdata["labels"].to(device)  # 最后一层 block 的 dst 节点标签
             
+            feats = subg.ndata['feat'][input_nodes].to(device)
+            labels = subg.ndata['labels'][output_nodes].to(device)
             # 调试：检查维度
-            print(f"Debug - input_nodes length: {len(input_nodes)}")
-            print(f"Debug - output_nodes length: {len(output_nodes)}")
-            print(f"Debug - blocks[0] src nodes: {blocks[0].num_src_nodes()}, dst nodes: {blocks[0].num_dst_nodes()}")
-            print(f"Debug - blocks[-1] src nodes: {blocks[-1].num_src_nodes()}, dst nodes: {blocks[-1].num_dst_nodes()}")
-            print(f"Debug - feats shape: {feats.shape}")
-            print(f"Debug - labels shape: {labels.shape}")
+            # print(f"Debug - input_nodes length: {len(input_nodes)}")
+            # print(f"Debug - output_nodes length: {len(output_nodes)}")
+            # print(f"Debug - blocks[0] src nodes: {blocks[0].num_src_nodes()}, dst nodes: {blocks[0].num_dst_nodes()}")
+            # print(f"Debug - blocks[-1] src nodes: {blocks[-1].num_src_nodes()}, dst nodes: {blocks[-1].num_dst_nodes()}")
+            # print(f"Debug - feats shape: {feats.shape}")
+            # print(f"Debug - labels shape: {labels.shape}")
 
             # 2️⃣ 前向传播
             logits = gnn(blocks, feats)
 
-            print(f"Debug - logits shape: {logits.shape}")
+            # print(f"Debug - logits shape: {logits.shape}")
 
             # 3️⃣ 计算交叉熵损失
             loss = nn.functional.cross_entropy(logits, labels)
@@ -174,6 +176,32 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
 
         print(f"Rank {rank} [Epoch {epoch+1}/{num_epochs}] 平均损失: {avg_loss:.4f}, 准确度: {avg_accuracy:.4f}")
 
+    # ============ 最终测试评估 ============
+    gnn.eval()
+    final_test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
+
+    if rank == 0:
+        torch.save(gnn.state_dict(), f"node_prediction_model_rank{rank}.pth")
+        print(f"Model saved as node_prediction_model_rank{rank}.pth")
+        print(f"Rank {rank} 最终测试准确度: {final_test_accuracy:.4f}")
+
+    # 在所有训练结束后进行完整的测试评估
+    final_test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
+
+    # 收集所有进程的测试准确度
+    test_acc_tensor = torch.tensor(final_test_accuracy, device=device)
+    all_test_acc = [torch.zeros_like(test_acc_tensor) for _ in range(world_size)]
+    dist.all_gather(all_test_acc, test_acc_tensor)
+
+    # 计算平均测试准确度
+    avg_test_accuracy = sum([acc.item() for acc in all_test_acc]) / world_size
+
+    if rank == 0:
+        print(f"\n📊 最终测试结果:")
+        print(f"各进程测试准确度: {[acc.item() for acc in all_test_acc]}")
+        print(f"平均测试准确度: {avg_test_accuracy:.4f}")
+        writer.add_scalar("Accuracy/final_test", avg_test_accuracy, num_epochs)
+
     dist.destroy_process_group()
     if writer:
         writer.close()
@@ -181,12 +209,55 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
         print("✅ Node classification 训练完成！")
 
 
+# ==========================================================
+# 4️⃣ 评估函数
+# ==========================================================
+def evaluate(model, test_loader, device, rank, world_size):
+    """
+    节点分类模型评估函数
+    
+    关键参数设置:
+    - model: 待评估的GNN模型
+    - test_loader: 测试数据加载器
+    - device: 计算设备
+    - rank: 当前进程排名
+    - world_size: 进程总数
+    """
+    model.eval()
+    total_accuracy = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for input_nodes, output_nodes, blocks in test_loader:
+            # 1️⃣ 获取节点特征和标签
+            feats = blocks[0].srcdata["feat"].to(device)
+            labels = blocks[-1].dstdata["labels"].to(device)
+            
+            # 2️⃣ 前向传播获取预测结果
+            logits = model(blocks, feats)
+            
+            # 3️⃣ 计算准确度
+            preds = logits.argmax(dim=1)
+            accuracy = (preds == labels).float().mean().item()
+            
+            total_accuracy += accuracy
+            num_batches += 1
+    
+    # 4️⃣ 同步所有进程的准确度
+    avg_accuracy = total_accuracy / num_batches if num_batches > 0 else 0.0
+    avg_accuracy_tensor = torch.tensor(avg_accuracy, device=device)
+    dist.all_reduce(avg_accuracy_tensor, op=dist.ReduceOp.SUM)
+    avg_accuracy_tensor /= world_size
+    
+    model.train()
+    return avg_accuracy_tensor.item()
+
 
 # ==========================================================
-# 4️⃣ 主入口
+# 5️⃣ 主入口
 # ==========================================================
 if __name__ == "__main__":
-    graph_dir = prepare_graph(graph_dir="datasets/node_cls_small_twolayer", num_parts=3, nodes=200)
+    graph_dir = prepare_graph(graph_dir="datasets/node_cls_ER", num_parts=3, nodes=1000)
     world_size = 3
     device = None
     # 使用mp.spawn启动分布式训练
