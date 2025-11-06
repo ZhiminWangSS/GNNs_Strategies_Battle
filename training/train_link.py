@@ -38,16 +38,19 @@ class CommunicationMonitor:
         self.end_time = time.time()
 
     def get_bandwidth(self):
+        if self.start_time is None or self.end_time is None:
+            return 0.0, 0.0
         duration = max(1e-6, self.end_time - self.start_time)
-        mb = self.total_bytes / (1024 * 1024)
-        return mb, mb / duration  # (通信量 MB, 带宽 MB/s)
+        kb = self.total_bytes / (1024)
+        return kb, kb / duration  # (通信量 KB, 带宽 KB/s)
+
 
 # ==========================================================
 # 1️⃣ 初始化分布式环境
 # ==========================================================
 def setup_distributed(rank, world_size):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = "29501"
     torch.cuda.set_device(rank)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     device = torch.device(f"cuda:{rank}")
@@ -58,16 +61,10 @@ def setup_distributed(rank, world_size):
 # ==========================================================
 # 🔍 通信统计模块
 # ==========================================================
-comm_monitor = CommunicationMonitor()
 
-def communication_hook(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
-    """DDP通信Hook函数，用于监控通信量"""
-    tensor = bucket.buffer()
-    comm_monitor.record_communication(tensor.numel() * tensor.element_size())
-    
-    # 调用默认的通信操作
-    fut = dist._all_reduce_fut(bucket)
-    return fut
+
+
+
 
 
 
@@ -102,7 +99,7 @@ def prepare_graph(graph_dir="datasets/graph_parts", num_parts=3, nodes=20):
     return graph_dir
 
 
-def train_fn(rank, world_size, graph_dir, num_epochs=100, lr=0.001):
+def train_fn(rank, world_size, graph_dir, num_epochs=20, lr=0.001):
     """
     分布式训练函数，由mp.spawn调用
     
@@ -166,10 +163,17 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
     model = GCN(input_dim, hidden_dim, output_dim, dropout=0.0).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
-    
+    comm_monitor = CommunicationMonitor()
+    def communication_hook(state, bucket: dist.GradBucket):
+        tensor = bucket.buffer()
+        comm_monitor.hook(tensor)
+        fut = dist.all_reduce(tensor, async_op=True).get_future()
+        # print(f"[Rank {rank}] Hook triggered with tensor size {tensor.numel()} ({tensor.numel() * tensor.element_size()/1024:.2f} KB)")
+        return fut.then(lambda fut: fut.value()[0])
+    # 注册通信hook以监控通信量
+    model.register_comm_hook(state=None, hook=communication_hook)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    comm_monitor = CommunicationMonitor()
 
     if rank == 0:
         print(f"🚀 模型初始化完成: {sum(p.numel() for p in model.parameters()):,} 参数")
@@ -191,9 +195,7 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
         total_loss, total_acc = 0.0, 0.0
         num_batches = 0
         epoch_forward, epoch_backward, epoch_comm, epoch_batch = 0.0, 0.0, 0.0, 0.0
-        epoch_comm_mb, epoch_comm_bw = 0.0, 0.0
-        comm_monitor.start()
-        
+        epoch_comm_kb, epoch_comm_bw = 0.0, 0.0
         iter = 1
         if iter <= local_num_batches:
             for input_nodes, pos_pair_graph, neg_pair_graph, blocks in train_loader:
@@ -231,7 +233,9 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
                 # ============ 反向传播与优化 ============
                 backward_start = time.time()
                 optimizer.zero_grad()
+                comm_monitor.start()
                 loss.backward()
+                comm_monitor.stop()
                 optimizer.step()
                 batch_time = time.time() - batch_start
                 backward_time = (time.time() - backward_start)
@@ -240,9 +244,7 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
                 predictions = (torch.sigmoid(scores) > 0.5).float()
                 acc = (predictions == labels).float().mean().item()
                 
-                # ====== 通信统计 ======
-                comm_monitor.stop()
-                comm_mb, comm_bw = comm_monitor.get_bandwidth()
+                
                 
                 # 获取GPU内存使用情况
                 gpu_memory_allocated = 0.0
@@ -251,28 +253,31 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
                 try:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                        gpu_memory_allocated = torch.cuda.memory_allocated(device) / (1024**3)  # GB
-                        gpu_memory_reserved = torch.cuda.memory_reserved(device) / (1024**3)  # GB
+                        gpu_memory_allocated = torch.cuda.memory_allocated(device) / (1024**2)  # GB
+                        gpu_memory_reserved = torch.cuda.memory_reserved(device) / (1024**2)  # GB
                         gpus = GPUtil.getGPUs()
                         if gpus:
                             gpu_utilization = gpus[local_rank].load * 100  # %
                 except:
                     pass
-
+                
                 total_loss += loss.item()
                 total_acc += acc
                 num_batches += 1
                 epoch_forward += forward_time
                 epoch_backward += backward_time
-                epoch_comm += comm_monitor.end_time - comm_monitor.start_time
                 epoch_batch += batch_time
-                epoch_comm_mb += comm_mb
-                epoch_comm_bw += comm_bw
+                # epoch_comm_mb += comm_mb
+                # epoch_comm_bw += comm_bw
                 
                 if num_batches % 10 == 0:
                     print(f"Rank {rank} batch {num_batches} 内训练中, loss: {loss.item():.4f}, acc: {acc:.4f}")
                 iter += 1
         
+        # ====== 通信统计 ======
+        epoch_comm = comm_monitor.end_time - comm_monitor.start_time
+        epoch_comm_kb, epoch_comm_bw = comm_monitor.get_bandwidth()
+        print(f"Rank {rank} 通信量: {epoch_comm_kb:.4f} KB, {epoch_comm_bw:.4f} KB/s")
         # 7️⃣ 同步其他进程的批次训练（确保分布式训练同步）
         if iter > local_num_batches:
             for _ in range(max_num_batches - local_num_batches):
@@ -301,10 +306,10 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
             writer.add_scalar("Time/backward", epoch_backward / num_batches, epoch)
             writer.add_scalar("Time/comm", epoch_comm / num_batches, epoch)
             writer.add_scalar("Time/batch", epoch_batch / num_batches, epoch)
-            writer.add_scalar("Comm/volume_MB", epoch_comm_mb / num_batches, epoch)
-            writer.add_scalar("Comm/bandwidth_MBps", epoch_comm_bw / num_batches, epoch)
-            writer.add_scalar("GPU/memory_allocated_GB", gpu_memory_allocated, epoch)
-            writer.add_scalar("GPU/memory_reserved_GB", gpu_memory_reserved, epoch)
+            writer.add_scalar("Comm/volume_KB", epoch_comm_kb / num_batches, epoch)
+            writer.add_scalar("Comm/bandwidth_KBps", epoch_comm_bw / num_batches, epoch)
+            writer.add_scalar("GPU/memory_allocated_MB", gpu_memory_allocated, epoch)
+            writer.add_scalar("GPU/memory_reserved_MB", gpu_memory_reserved, epoch)
             writer.add_scalar("GPU/utilization_percent", gpu_utilization, epoch)
 
         if rank == 0:
