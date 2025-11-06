@@ -15,22 +15,37 @@ class GCN(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
-        self.conv1 = dglnn.GraphConv(input_dim, hidden_dim)
-        self.conv2 = dglnn.GraphConv(hidden_dim, output_dim)
+        self.conv1 = dglnn.GraphConv(input_dim, hidden_dim, allow_zero_in_degree=True)
+        self.conv2 = dglnn.GraphConv(hidden_dim, output_dim, allow_zero_in_degree=True)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else None
     
     def forward(self, g: dgl.DGLGraph, features: torch.Tensor) -> torch.Tensor:
         
-        # 对于边预测任务，features是拼接的节点特征
-        # 需要确保图结构和特征维度匹配
-        h = self.conv1(g, features)
-        h = torch.relu(h)
-        
-        if self.dropout is not None:
-            h = self.dropout(h)
-        
-        h = self.conv2(g, h)
-        
+        # 支持blocks列表输入
+        if isinstance(g, list):
+            # 对于blocks列表，使用第一个block进行图卷积
+            h = self.conv1(g[0], features)
+            h = torch.relu(h)
+            
+            if self.dropout is not None:
+                h = self.dropout(h)
+            
+            h = self.conv2(g[1], h)
+            
+            # 对于节点分类，返回最后一个block的dst节点的输出
+            # 确保只返回output_nodes对应的输出
+            return h
+        else:
+            # 对于边预测任务，features是拼接的节点特征
+            # 需要确保图结构和特征维度匹配
+            h = self.conv1(g, features)
+            h = torch.relu(h)
+            
+            if self.dropout is not None:
+                h = self.dropout(h)
+            
+            h = self.conv2(g, h)
+            
         
         return h
     
@@ -72,6 +87,7 @@ if __name__ == "__main__":
     # Compute loss and accuracy (example)
     labels = torch.randint(0, output_dim, (num_nodes,))
     train_mask = torch.ones(num_nodes, dtype=torch.bool)
+    
     
     loss = model.compute_loss(logits, labels, train_mask)
     accuracy = model.compute_accuracy(logits, labels, train_mask)

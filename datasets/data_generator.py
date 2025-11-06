@@ -107,6 +107,9 @@ class GraphGenerator:
         g.ndata['feat'] = torch.tensor(node_features, dtype=torch.float32)
         g.ndata['orig_id'] = torch.arange(n)
 
+        # 添加自环以处理0入度节点
+        g = dgl.add_self_loop(g)
+
         return g
 
     def add_node_labels(self, g: dgl.DGLGraph, num_classes: int = 3, homophily: float = 0.8, label_key: str = 'labels') -> None:
@@ -235,7 +238,7 @@ class GraphGenerator:
         perm = torch.randperm(len(all_nodes))
         train_nodes = all_nodes[perm[:num_train]]
         test_nodes = all_nodes[perm[num_train:]]
-
+        # batch_size = int(np.floor(len(train_nodes) / 5))
         # 构建训练 DataLoader
         train_loader = dgl.dataloading.DataLoader(
             subg,
@@ -305,7 +308,7 @@ class GraphGenerator:
         perm = torch.randperm(len(all_edges))
         train_edges = all_edges[perm[:num_train]]
         test_edges = all_edges[perm[num_train:]]
-
+        batch_size = int(np.floor(len(train_edges) / 5))
         # 构建训练 DataLoader
         train_loader = dgl.dataloading.DataLoader(
             subg,
@@ -337,7 +340,7 @@ class GraphGenerator:
 
 
 if __name__ == "__main__":
-    task = 'node_classification'
+    task = 'link_prediction'
     batch_size = 8
     device = torch.device("cpu")
     seed = 123
