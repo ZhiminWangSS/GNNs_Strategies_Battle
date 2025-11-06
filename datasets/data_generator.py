@@ -11,6 +11,9 @@ import dgl.distributed as dist_dgl
 import multiprocessing
 import scipy.sparse as sps
 import yaml
+import math
+import json
+import matplotlib.pyplot as plt
 
 # ---------------------------
 #   Graph Generator
@@ -30,11 +33,55 @@ class GraphGenerator:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
+    # def generate_nx_graph(self, kind: str = 'ER', n_nodes: int = 1000, p: float = 0.01, m: int = 2,
+    #                       sbm_sizes: Optional[List[int]] = None,
+    #                       sbm_p_in: float = 0.1, sbm_p_out: float = 0.01, seed: Optional[int] = None) -> nx.Graph:
+    #     """
+    #     生成NetworkX图。
+
+    #     参数:
+    #     - kind (str): 图的生成模式 ('ER', 'BA', 'SBM')。
+    #     - seed (Optional[int]): 随机种子，确保图可复现。
+    #     for ER and BA
+    #     - n_nodes (int): 节点数量。
+    #     for ER
+    #         - p (float): ER图的边生成概率。
+    #     for BA
+    #     - m (int): BA图的每个新节点连接的边数。
+    #     for SBM
+    #     - sbm_sizes (Optional[List[int]]): SBM图的社区大小列表。
+    #     - sbm_p_in (float): SBM图社区内边的生成概率。
+    #     - sbm_p_out (float): SBM图社区间边的生成概率
+
+
+    #     返回:
+    #     - nx.Graph: 生成的NetworkX图。
+    #     """
+    #     seed = seed if seed is not None else self.seed
+    #     if kind.upper() == 'ER':
+    #         G = nx.fast_gnp_random_graph(n_nodes, p, seed=seed)
+    #     elif kind.upper() == 'BA':
+    #         m_eff = min(m, max(1, n_nodes-1))
+    #         G = nx.barabasi_albert_graph(n_nodes, m_eff, seed=seed)
+    #     elif kind.upper() == 'SBM':
+    #         if sbm_sizes is None:
+    #             raise ValueError("SBM requires sbm_sizes")
+    #         k = len(sbm_sizes)
+    #         p_matrix = [
+    #             [sbm_p_in if i == j else sbm_p_out for j in range(k)] for i in range(k)]
+    #         G = nx.stochastic_block_model(sbm_sizes, p_matrix, seed=seed)
+    #         G = nx.Graph(G)
+    #         G.remove_edges_from(nx.selfloop_edges(G))
+    #     else:
+    #         raise ValueError(f"Unknown kind: {kind}")
+    #     G = nx.convert_node_labels_to_integers(G, ordering='sorted')
+    #     return G
+
     def generate_nx_graph(self, kind: str = 'ER', n_nodes: int = 1000, p: float = 0.01, m: int = 2,
-                          sbm_sizes: Optional[List[int]] = None,
-                          sbm_p_in: float = 0.1, sbm_p_out: float = 0.01, seed: Optional[int] = None) -> nx.Graph:
+                      sbm_sizes: Optional[List[int]] = None, output_dir:str = "./tmp/graph",
+                      sbm_p_in: float = 0.1, sbm_p_out: float = 0.01, save_global_feature=True, save_figure=False) -> nx.Graph:
         """
-        生成NetworkX图。
+        生成NetworkX图，并计算全局特征。
 
         参数:
         - kind (str): 图的生成模式 ('ER', 'BA', 'SBM')。
@@ -48,13 +95,13 @@ class GraphGenerator:
         for SBM
         - sbm_sizes (Optional[List[int]]): SBM图的社区大小列表。
         - sbm_p_in (float): SBM图社区内边的生成概率。
-        - sbm_p_out (float): SBM图社区间边的生成概率
-
+        - sbm_p_out (float): SBM图社区间边的生成概率。
 
         返回:
         - nx.Graph: 生成的NetworkX图。
+        - Dict[str, float]: 图的全局特征。
         """
-        seed = seed if seed is not None else self.seed
+        seed = self.seed
         if kind.upper() == 'ER':
             G = nx.fast_gnp_random_graph(n_nodes, p, seed=seed)
         elif kind.upper() == 'BA':
@@ -71,8 +118,67 @@ class GraphGenerator:
             G.remove_edges_from(nx.selfloop_edges(G))
         else:
             raise ValueError(f"Unknown kind: {kind}")
+
         G = nx.convert_node_labels_to_integers(G, ordering='sorted')
+
+        # 计算全局特征
+        num_nodes = G.number_of_nodes()
+        num_edges = G.number_of_edges()
+        degrees = [deg for _, deg in G.degree()]
+        avg_degree = sum(degrees) / num_nodes if num_nodes > 0 else 0
+        density = nx.density(G)
+        clustering = nx.average_clustering(G)
+        num_components = nx.number_connected_components(G)
+
+        # 只对连通图计算最短路径与直径
+        if nx.is_connected(G):
+            avg_shortest_path = nx.average_shortest_path_length(G)
+            diameter = nx.diameter(G)
+        else:
+            avg_shortest_path = float('nan')
+            diameter = float('nan')
+
+        global_features = {
+            "num_nodes": num_nodes,
+            "num_edges": num_edges,
+            "avg_degree": avg_degree,
+            "density": density,
+            "avg_clustering": clustering,
+            "num_components": num_components,
+            "avg_shortest_path": avg_shortest_path,
+            "diameter": diameter
+        }
+
+        if save_global_feature:
+            os.makedirs(output_dir, exist_ok=True)
+            feature_path = os.path.join(output_dir, f"{kind}_features_seed{seed}.json")
+
+            clean_features = {k: (None if isinstance(v, float) and math.isnan(v) else v)
+                            for k, v in global_features.items()}
+
+            with open(feature_path, "w", encoding="utf-8") as f:
+                json.dump(clean_features, f, indent=4, ensure_ascii=False)
+
+            print(f"Graph features saved to: {feature_path}")
+
+        # 保存图像
+        if save_figure:
+            plt.figure(figsize=(6, 6))
+            pos = nx.spring_layout(G, seed=seed)  # 可改为 kamada_kawai_layout 或 random_layout
+            nx.draw_networkx_nodes(G, pos, node_size=30, node_color="skyblue", alpha=0.8)
+            nx.draw_networkx_edges(G, pos, width=0.5, alpha=0.6)
+            plt.title(f"{kind} Graph (n={num_nodes}, edges={num_edges})", fontsize=12)
+            plt.axis("off")
+
+            img_path = os.path.join(output_dir, f"{kind}_graph_seed{seed}.png")
+            plt.tight_layout()
+            plt.savefig(img_path, dpi=300)
+            plt.close()
+
+            print(f"Graph visualization saved to: {img_path}")
+
         return G
+
 
     def nx_to_dgl(self, G: nx.Graph) -> dgl.DGLGraph:
         """
@@ -368,10 +474,10 @@ if __name__ == "__main__":
     seed = 123
     n_nodes = 2000
     p = 0.01
-    num_parts = 1
+    num_parts = 3
 
     gen = GraphGenerator(seed=123)
-    G_nx = gen.generate_nx_graph(kind='ER', n_nodes=2000, p=0.01) # 生成可控图
+    G_nx = gen.generate_nx_graph(kind='ER', n_nodes=200, p=0.01, sbm_sizes=[66,66,66], save_figure=False, save_global_feature=True) # 生成可控图
     g = gen.nx_to_dgl(G_nx)
     if task == 'node_classification':
         gen.add_node_labels(g)
