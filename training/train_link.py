@@ -1,50 +1,73 @@
 import os
+import sys
 import time
 import torch
 import torch.nn as nn
-import dgl
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
-import sys
-import psutil
-import GPUtil
 import torch.multiprocessing as mp
+import datetime
+from torch.nn.parallel import DistributedDataParallel as DDP
+import dgl
+from torch.utils.tensorboard import SummaryWriter
 
-# ==========================================================
-# 添加当前目录到系统路径
-# ==========================================================
+
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from models.gcn import GCN
 from datasets.data_generator import GraphGenerator
-import datetime
 
+
+
+class CommunicationMonitor:
+    def __init__(self):
+        self.total_bytes = 0
+        self.start_time = None
+        self.end_time = None
+
+    def start(self):
+        self.total_bytes = 0
+        self.start_time = time.time()
+
+    def hook(self, tensor):
+        """每次通信自动统计数据量"""
+        self.total_bytes += tensor.numel() * tensor.element_size()
+        return tensor
+
+    def stop(self):
+        self.end_time = time.time()
+
+    def get_bandwidth(self):
+        duration = max(1e-6, self.end_time - self.start_time)
+        mb = self.total_bytes / (1024 * 1024)
+        return mb, mb / duration  # (通信量 MB, 带宽 MB/s)
 
 # ==========================================================
-# 1️⃣ 初始化分布式训练环境
+# 1️⃣ 初始化分布式环境
 # ==========================================================
 def setup_distributed(rank, world_size):
-    """
-    初始化分布式训练环境
-    
-    关键参数设置:
-    - MASTER_ADDR: 主节点地址，通常为localhost
-    - MASTER_PORT: 通信端口
-    - backend: 通信后端，GPU推荐使用nccl
-    """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29500"
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    
     torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", 
-                            rank=rank, 
-                            world_size=world_size)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     device = torch.device(f"cuda:{rank}")
-    
-    print(f"🚀 Rank {rank}: 初始化分布式训练环境")
+    print(f"🚀 Rank {rank}: 初始化分布式环境")
     return device
+
+
+# ==========================================================
+# 🔍 通信统计模块
+# ==========================================================
+comm_monitor = CommunicationMonitor()
+
+def communication_hook(state: object, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
+    """DDP通信Hook函数，用于监控通信量"""
+    tensor = bucket.buffer()
+    comm_monitor.record_communication(tensor.numel() * tensor.element_size())
+    
+    # 调用默认的通信操作
+    fut = dist._all_reduce_fut(bucket)
+    return fut
 
 
 
@@ -129,28 +152,33 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
         sampler_fanouts=[10, 10, 5],  # 关键参数: 邻居采样配置
         partition_dir=graph_dir
     )
-    print(f"Batch size: {train_loader.batch_size}")
+    # print(f"Batch size: {train_loader.batch_size}")
     num_batches = len(train_loader)
-    print(f"每个 epoch 需要迭代 {num_batches} 次")
-    if rank == 0:
-        print(f"📊 Rank {rank} 加载完成 dataloader（子图 {rank}）")
+    # print(f"每个 epoch 需要迭代 {num_batches} 次")
+    # if rank == 0:
+    #     print(f"📊 Rank {rank} 加载完成 dataloader（子图 {rank}）")
     subg = subg.to(device)
     # 模型初始化
     input_dim = 4   # 关键参数: 输入特征维度
     hidden_dim = 64  # 关键参数: 隐藏层维度
-    output_dim = 1   # 关键参数: 输出维度(链路预测得分)
+    output_dim = 32   # 关键参数: 输出维度(链路预测得分)
     
-    gnn = GCN(input_dim, hidden_dim, output_dim, dropout=0.0).to(device)
-    gnn = DDP(gnn, device_ids=[local_rank], output_device=local_rank)
-    optimizer = torch.optim.Adam(gnn.parameters(), lr=lr)
+    model = GCN(input_dim, hidden_dim, output_dim, dropout=0.0).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    
+    
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    comm_monitor = CommunicationMonitor()
 
     if rank == 0:
-        print(f"🚀 模型初始化完成: {sum(p.numel() for p in gnn.parameters()):,} 参数")
+        print(f"🚀 模型初始化完成: {sum(p.numel() for p in model.parameters()):,} 参数")
 
-    # ============ 开始训练 ============
-    gnn.train()
-    prev_comm_time = 0
-
+    # ======================================================
+    # 🔍 训练循环
+    # ======================================================
+    model.train()
+    
     # 同步各进程的批次数量，确保分布式训练同步
     local_num_batches = len(train_loader)
     num_batches_tensor = torch.tensor(local_num_batches, device=device)
@@ -158,89 +186,91 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
     dist.all_gather(all_num_batches, num_batches_tensor)
     max_num_batches = max([x.item() for x in all_num_batches])
     
-    # ============ 训练循环 ============
     for epoch in range(num_epochs):
-        epoch_start_time = time.time()
-        total_loss = 0.0
-        total_accuracy = 0.0
+        model.train()
+        total_loss, total_acc = 0.0, 0.0
         num_batches = 0
-        epoch_comm_time = 0
-        epoch_forward_time = 0
-        epoch_backward_time = 0
+        epoch_forward, epoch_backward, epoch_comm, epoch_batch = 0.0, 0.0, 0.0, 0.0
+        epoch_comm_mb, epoch_comm_bw = 0.0, 0.0
+        comm_monitor.start()
         
         iter = 1
         if iter <= local_num_batches:
             for input_nodes, pos_pair_graph, neg_pair_graph, blocks in train_loader:
-                
-                comm_start_time = time.time()
-
-                # 1️⃣ 取出节点特征（输入层源节点）
+                batch_start = time.time()
+                # ============ 数据准备 ============
                 feats = subg.ndata['feat'][input_nodes].to(device)
-                # feats = blocks[0].srcdata["feat"].to(device)
-
-                # 2️⃣ 使用 blocks 做 GCN 前向编码（message passing）
-                # gnn 的 forward 需要 (blocks, feats)
-                node_emb = gnn(blocks, feats)   # 输出的是目标节点的embedding（最后一层block的dst节点）
-
-                comm_end_time = time.time()
-                epoch_comm_time += (comm_end_time - comm_start_time)
                 
-                # 3️⃣ 从正样本图中取出边两端节点的 embedding
+                # ============ 前向传播 ============
+                forward_start = time.time()
+                node_emb = model(blocks, feats)   # 输出目标节点的embedding
+                
+                
+                # 正样本embedding提取和得分计算
                 pos_src, pos_dst = pos_pair_graph.edges()
                 pos_src_emb = node_emb[pos_src]
                 pos_dst_emb = node_emb[pos_dst]
-                # 点乘得分
                 pos_score = (pos_src_emb * pos_dst_emb).sum(dim=1)
-
-                # 4️⃣ 从负样本图中取出边两端节点的 embedding
+                
+                
+                # 负样本embedding提取和得分计算
                 neg_src, neg_dst = neg_pair_graph.edges()
                 neg_src_emb = node_emb[neg_src]
                 neg_dst_emb = node_emb[neg_dst]
                 neg_score = (neg_src_emb * neg_dst_emb).sum(dim=1)
                 
-                # 5️⃣ 计算链路预测损失（负样本标签为 0，正样本为 1）
+                # 计算链路预测损失
                 scores = torch.cat([pos_score, neg_score], dim=0)
                 labels = torch.cat([
                     torch.ones_like(pos_score),
                     torch.zeros_like(neg_score)
                 ]).to(device)
-
-                forward_start = time.time()
                 loss = nn.functional.binary_cross_entropy_with_logits(scores, labels)
-                forward_end = time.time()
-                epoch_forward_time += (forward_end - forward_start)
+                forward_time = (time.time() - forward_start)
                 
-                # 6️⃣ 反向传播与优化
+                # ============ 反向传播与优化 ============
                 backward_start = time.time()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                backward_end = time.time()
-                epoch_backward_time += (backward_end - backward_start)
+                batch_time = time.time() - batch_start
+                backward_time = (time.time() - backward_start)
 
                 # 计算准确度
                 predictions = (torch.sigmoid(scores) > 0.5).float()
-                accuracy = (predictions == labels).float().mean().item()
+                acc = (predictions == labels).float().mean().item()
                 
-                # 获取内存使用情况
-                process = psutil.Process()
-                memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+                # ====== 通信统计 ======
+                comm_monitor.stop()
+                comm_mb, comm_bw = comm_monitor.get_bandwidth()
                 
                 # 获取GPU内存使用情况
-                gpu_memory_usage = 0
+                gpu_memory_allocated = 0.0
+                gpu_memory_reserved = 0.0
+                gpu_utilization = 0.0
                 try:
-                    gpus = GPUtil.getGPUs()
-                    if gpus:
-                        gpu_memory_usage = gpus[local_rank].memoryUsed
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        gpu_memory_allocated = torch.cuda.memory_allocated(device) / (1024**3)  # GB
+                        gpu_memory_reserved = torch.cuda.memory_reserved(device) / (1024**3)  # GB
+                        gpus = GPUtil.getGPUs()
+                        if gpus:
+                            gpu_utilization = gpus[local_rank].load * 100  # %
                 except:
                     pass
 
                 total_loss += loss.item()
-                total_accuracy += accuracy
+                total_acc += acc
                 num_batches += 1
+                epoch_forward += forward_time
+                epoch_backward += backward_time
+                epoch_comm += comm_monitor.end_time - comm_monitor.start_time
+                epoch_batch += batch_time
+                epoch_comm_mb += comm_mb
+                epoch_comm_bw += comm_bw
                 
                 if num_batches % 10 == 0:
-                    print(f"Rank {rank} batch {num_batches} 内训练中, loss: {loss.item():.4f}, acc: {accuracy:.4f}")
+                    print(f"Rank {rank} batch {num_batches} 内训练中, loss: {loss.item():.4f}, acc: {acc:.4f}")
                 iter += 1
         
         # 7️⃣ 同步其他进程的批次训练（确保分布式训练同步）
@@ -248,85 +278,48 @@ def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.0
             for _ in range(max_num_batches - local_num_batches):
                 dist.all_reduce(torch.zeros(1, device=device))
 
-        # ============ 计算训练指标 ============
+        # ======================================================
+        # 📊 精度与耗时统计
+        # ======================================================
         # 计算平均损失和准确度
         avg_loss = total_loss / num_batches
-        avg_accuracy = total_accuracy / num_batches
-
+        avg_acc = total_acc / num_batches   
         # 同步所有进程的损失和准确度
-        avg_loss_tensor = torch.tensor(avg_loss, device=device)
-        avg_accuracy_tensor = torch.tensor(avg_accuracy, device=device)
-        
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(avg_accuracy_tensor, op=dist.ReduceOp.SUM)
-        
-        avg_loss_tensor /= world_size
-        avg_accuracy_tensor /= world_size
-
-        # 记录训练时间
-        epoch_time = time.time() - epoch_start_time
-
-        # ============ 日志记录 ============
-        # 记录到 TensorBoard（仅在 rank 0 进程记录）
+        avg_loss = torch.tensor(avg_loss, device=device)
+        avg_acc = torch.tensor(avg_acc, device=device)
+        dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_acc, op=dist.ReduceOp.AVG)
+        test_acc = evaluate(model, test_loader, device, rank, world_size, subg)
+        # ======================================================
+        # 📈 TensorBoard 写入
+        # ======================================================
         if rank == 0:
-            writer.add_scalar("Loss/train", avg_loss_tensor.item(), epoch)
-            writer.add_scalar("Accuracy/train", avg_accuracy_tensor.item(), epoch)
-            writer.add_scalar("Time/epoch", epoch_time, epoch)
-            writer.add_scalar("Time/communication", epoch_comm_time, epoch)
-            writer.add_scalar("Time/forward", epoch_forward_time, epoch)
-            writer.add_scalar("Time/backward", epoch_backward_time, epoch)
-            writer.add_scalar("Memory/usage", memory_usage, epoch)
+            writer.add_scalar("Loss/train", avg_loss.item(), epoch)
+            writer.add_scalar("Accuracy/train", avg_acc.item(), epoch)
+            writer.add_scalar("Accuracy/test", test_acc, epoch)
+            writer.add_scalar("Time/forward", epoch_forward / num_batches, epoch)
+            writer.add_scalar("Time/backward", epoch_backward / num_batches, epoch)
+            writer.add_scalar("Time/comm", epoch_comm / num_batches, epoch)
+            writer.add_scalar("Time/batch", epoch_batch / num_batches, epoch)
+            writer.add_scalar("Comm/volume_MB", epoch_comm_mb / num_batches, epoch)
+            writer.add_scalar("Comm/bandwidth_MBps", epoch_comm_bw / num_batches, epoch)
+            writer.add_scalar("GPU/memory_allocated_GB", gpu_memory_allocated, epoch)
+            writer.add_scalar("GPU/memory_reserved_GB", gpu_memory_reserved, epoch)
+            writer.add_scalar("GPU/utilization_percent", gpu_utilization, epoch)
 
-        # 打印训练信息
         if rank == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}, "
-                  f"Loss: {avg_loss_tensor.item():.4f}, "
-                  f"Accuracy: {avg_accuracy_tensor.item():.4f}, "
-                  f"Time: {epoch_time:.2f}s")
-
-        # # ============ 测试评估 ============
-        # # 每 10 个 epoch 进行一次测试评估
-        # if (epoch + 1) % 10 == 0:
-        #     test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
-        #     if rank == 0:
-        #         writer.add_scalar("Accuracy/test", test_accuracy, epoch)
-        #         print(f"Test Accuracy at epoch {epoch+1}: {test_accuracy:.4f}")
-
-    # ============ 模型保存 ============
-    # 保存模型（仅在 rank 0 进程保存）
-    if rank == 0:
-        torch.save(gnn.state_dict(), f"link_prediction_model_rank{rank}.pth")
-        print(f"Model saved as link_prediction_model_rank{rank}.pth")
-
-    # ============ 最终测试评估 ============
-    # 在所有训练结束后进行完整的测试评估
-    final_test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
-    
-    # 收集所有进程的测试准确度
-    test_acc_tensor = torch.tensor(final_test_accuracy, device=device)
-    all_test_acc = [torch.zeros_like(test_acc_tensor) for _ in range(world_size)]
-    dist.all_gather(all_test_acc, test_acc_tensor)
-    
-    # 计算平均测试准确度
-    avg_test_accuracy = sum([acc.item() for acc in all_test_acc]) / world_size
-    
-    if rank == 0:
-        print(f"\n📊 最终测试结果:")
-        print(f"各进程测试准确度: {[acc.item() for acc in all_test_acc]}")
-        print(f"平均测试准确度: {avg_test_accuracy:.4f}")
-        writer.add_scalar("Accuracy/final_test", avg_test_accuracy, num_epochs)
+                print(f"RANK:{rank} - [Epoch {epoch+1}] Loss={avg_loss.item():.4f}, TrainAcc={avg_acc.item():.4f}, TestAcc={test_acc:.4f}")
 
     # 关闭 TensorBoard writer
     if rank == 0:
         writer.close()
-
-    print(f"Rank {rank} training completed.")
+        print(f"Rank {rank} training completed.")
 
 
 # ==========================================================
-# 5️⃣ 评估函数
+# 🔍 评估函数
 # ==========================================================
-def evaluate(model, test_loader, device, rank, world_size):
+def evaluate(model, test_loader, device, rank, world_size, subg):
     """
     模型评估函数
     
@@ -343,38 +336,39 @@ def evaluate(model, test_loader, device, rank, world_size):
     
     with torch.no_grad():
         for input_nodes, pos_pair_graph, neg_pair_graph, blocks in test_loader:
-            # 1️⃣ 获取节点特征
-            feats = blocks[0].srcdata["feat"].to(device)
+            # ============ 数据准备 ============
+            feats = subg.ndata['feat'][input_nodes].to(device)
             
-            # 2️⃣ GCN前向传播获取节点嵌入
+            # ============ 前向传播 ============
             node_emb = model(blocks, feats)
             
-            # 3️⃣ 计算正样本和负样本的预测得分
+            # ============ 正样本得分计算 ============
             pos_src, pos_dst = pos_pair_graph.edges()
             pos_src_emb = node_emb[pos_src]
             pos_dst_emb = node_emb[pos_dst]
             pos_score = (pos_src_emb * pos_dst_emb).sum(dim=1)
             
+            # ============ 负样本得分计算 ============
             neg_src, neg_dst = neg_pair_graph.edges()
             neg_src_emb = node_emb[neg_src]
             neg_dst_emb = node_emb[neg_dst]
             neg_score = (neg_src_emb * neg_dst_emb).sum(dim=1)
             
-            # 4️⃣ 合并正负样本得分和标签
+            # ============ 损失计算 ============
             scores = torch.cat([pos_score, neg_score], dim=0)
             labels = torch.cat([
                 torch.ones_like(pos_score),
                 torch.zeros_like(neg_score)
             ]).to(device)
             
-            # 5️⃣ 计算准确度
+            # ============ 准确度计算 ============
             predictions = (torch.sigmoid(scores) > 0.5).float()
             accuracy = (predictions == labels).float().mean().item()
             
             total_accuracy += accuracy
             num_batches += 1
     
-    # 6️⃣ 同步所有进程的准确度
+    # ============ 分布式同步 ============
     avg_accuracy = total_accuracy / num_batches if num_batches > 0 else 0.0
     avg_accuracy_tensor = torch.tensor(avg_accuracy, device=device)
     dist.all_reduce(avg_accuracy_tensor, op=dist.ReduceOp.SUM)

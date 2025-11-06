@@ -10,260 +10,238 @@ import sys
 import psutil
 import GPUtil
 import torch.multiprocessing as mp
+import datetime
 
 # ==========================================================
-# 添加当前目录到系统路径
+# 添加路径
 # ==========================================================
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.gcn import GCN
 from datasets.data_generator import GraphGenerator
-import datetime
 
 
 # ==========================================================
-# 1️⃣ 初始化分布式训练环境
+# 1️⃣ 初始化分布式环境
 # ==========================================================
 def setup_distributed(rank, world_size):
-    """初始化分布式环境"""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29500"
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    
     torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", 
-                            rank=rank, 
-                            world_size=world_size)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     device = torch.device(f"cuda:{rank}")
-    
-    print(f"🚀 Rank {rank}: 初始化分布式训练环境")
+    print(f"🚀 Rank {rank}: 初始化分布式环境")
     return device
 
 
-def train_fn(rank, world_size, graph_dir, num_epochs=200, lr=0.001):
-    """分布式训练函数，由mp.spawn调用"""
-    device = None
-    try:
-        device = setup_distributed(rank, world_size)
-        local_rank = rank
-        print(f"Rank {rank} 启动训练进程")
-        # 训练函数调用
-        train(rank, local_rank, world_size, device, graph_dir=graph_dir, num_epochs=num_epochs, lr=lr)
-    except Exception as e:
-        print(f"Rank {rank} 训练过程中出现异常: {e}")
-    finally:
-        # 只在进程组成功初始化后才销毁
-        if dist.is_initialized():
-            dist.destroy_process_group()
+# ==========================================================
+# 2️⃣ 通信统计模块（hook）
+# ==========================================================
+class CommunicationMonitor:
+    def __init__(self):
+        self.total_bytes = 0
+        self.start_time = None
+        self.end_time = None
+
+    def start(self):
+        self.total_bytes = 0
+        self.start_time = time.time()
+
+    def hook(self, tensor):
+        """每次通信自动统计数据量"""
+        self.total_bytes += tensor.numel() * tensor.element_size()
+        return tensor
+
+    def stop(self):
+        self.end_time = time.time()
+
+    def get_bandwidth(self):
+        duration = max(1e-6, self.end_time - self.start_time)
+        mb = self.total_bytes / (1024 * 1024)
+        return mb, mb / duration  # (通信量 MB, 带宽 MB/s)
 
 
 # ==========================================================
-# 2️⃣ 图生成与划分
+# 3️⃣ 评估函数
 # ==========================================================
-def prepare_graph(graph_dir="datasets/graph_parts", num_parts=3, nodes=20):
-    """生成或加载划分好的图"""
-    if not os.path.exists(graph_dir):
-        print(f"🔧 生成新的图数据并划分...")
-        os.makedirs(graph_dir, exist_ok=True)
-        gen = GraphGenerator()
-        G_nx = gen.generate_nx_graph(kind='ER', n_nodes=nodes, p=0.01,sbm_sizes=[1000,500,300,200])
-        g = gen.nx_to_dgl(G_nx)
-        gen.add_node_labels(g)
+def evaluate(model, test_loader, device, rank, world_size, subg):
+    model.eval()
+    total_acc = 0.0
+    num_batches = 0
 
-        # 同时生成 metis 和 random 划分
-        gen.partition_graph(g, num_parts=num_parts, method='metis', output_dir=graph_dir)
+    with torch.no_grad():
+        for input_nodes, output_nodes, blocks in test_loader:
+            feats = subg.ndata["feat"][input_nodes].to(device)
+            labels = subg.ndata["labels"][output_nodes].to(device)
+            logits = model(blocks, feats)
+            preds = logits.argmax(dim=1)
+            acc = (preds == labels).float().mean().item()
+            total_acc += acc
+            num_batches += 1
 
-        print(f"✅ 图数据生成和划分完成")
-
-    return graph_dir
+    avg_acc = total_acc / num_batches if num_batches > 0 else 0
+    acc_tensor = torch.tensor(avg_acc, device=device)
+    dist.all_reduce(acc_tensor, op=dist.ReduceOp.AVG)
+    return acc_tensor.item()
 
 
 # ==========================================================
-# 3️⃣ 训练函数
+# 4️⃣ 主训练函数
 # ==========================================================
 def train(rank, local_rank, world_size, device, graph_dir, num_epochs=20, lr=0.001, partition_method="metis"):
-    
     torch.manual_seed(0)
-
-    # 初始化 TensorBoard，仅 rank 0 写日志
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer = SummaryWriter(log_dir=f"runs/node_classification_{timestamp}_rank{rank}") if rank == 0 else None
+    writer = SummaryWriter(log_dir=f"runs/node_cls_rank{rank}_{timestamp}") if rank == 0 else None
 
-    # 数据加载器初始化 - 每个rank加载对应的子图分区
+    # 数据加载
     gen = GraphGenerator()
     train_loader, test_loader, subg = gen.get_dataloader_for_node_classification(
         pid=rank,
         partition_method=partition_method,
         batch_size=32,
         train_ratio=0.8,
-        num_workers=0,
         device=device,
         sampler_fanouts=[10, 5],
-        partition_dir=graph_dir
+        partition_dir=graph_dir,
     )
     subg = subg.to(device)
-    if rank == 0:
-        print(f"📊 Rank {rank} 加载完成 dataloader（子图 {rank}）")
 
     # 模型初始化
     input_dim = 4
     hidden_dim = 64
-    num_classes = subg.ndata['labels'].max().item() + 1
-    gnn = GCN(input_dim, hidden_dim, num_classes, dropout=0.0).to(device)
-    gnn = DDP(gnn, device_ids=[local_rank], output_device=local_rank)
-    optimizer = torch.optim.Adam(gnn.parameters(), lr=lr)
+    num_classes = subg.ndata["labels"].max().item() + 1
+    model = GCN(input_dim, hidden_dim, num_classes, dropout=0.0).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    comm_monitor = CommunicationMonitor()
 
     if rank == 0:
-        print(f"🚀 模型初始化完成: {sum(p.numel() for p in gnn.parameters()):,} 参数")
+        print(f"🚀 模型初始化完成: {sum(p.numel() for p in model.parameters()):,} 参数")
 
-    # ============ 开始训练 ============ 
-    gnn.train()
+    # ======================================================
+    # 🔍 训练循环
+    # ======================================================
     for epoch in range(num_epochs):
-        total_loss = 0.0
-        total_accuracy = 0.0
-        num_batches = 0
 
-        for input_nodes, output_nodes, blocks in train_loader:
-            # 1️⃣ 获取节点特征和标签
-            # feats = blocks[0].srcdata["feat"].to(device)
-            # labels = blocks[-1].dstdata["labels"].to(device)  # 最后一层 block 的 dst 节点标签
-            
-            feats = subg.ndata['feat'][input_nodes].to(device)
-            labels = subg.ndata['labels'][output_nodes].to(device)
-            # 调试：检查维度
-            # print(f"Debug - input_nodes length: {len(input_nodes)}")
-            # print(f"Debug - output_nodes length: {len(output_nodes)}")
-            # print(f"Debug - blocks[0] src nodes: {blocks[0].num_src_nodes()}, dst nodes: {blocks[0].num_dst_nodes()}")
-            # print(f"Debug - blocks[-1] src nodes: {blocks[-1].num_src_nodes()}, dst nodes: {blocks[-1].num_dst_nodes()}")
-            # print(f"Debug - feats shape: {feats.shape}")
-            # print(f"Debug - labels shape: {labels.shape}")
+            model.train()
+            total_loss, total_acc = 0.0, 0.0
+            num_batches = 0
+            epoch_forward, epoch_backward, epoch_comm, epoch_batch = 0.0, 0.0, 0.0, 0.0
+            epoch_comm_mb, epoch_comm_bw = 0.0, 0.0
+            comm_monitor.start()
 
-            # 2️⃣ 前向传播
-            logits = gnn(blocks, feats)
+            for input_nodes, output_nodes, blocks in train_loader:
+                batch_start = time.time()
 
-            # print(f"Debug - logits shape: {logits.shape}")
+                # ====== 1️⃣ 数据准备 ======
+                feats = subg.ndata["feat"][input_nodes].to(device)
+                labels = subg.ndata["labels"][output_nodes].to(device)
 
-            # 3️⃣ 计算交叉熵损失
-            loss = nn.functional.cross_entropy(logits, labels)
+                # ====== 2️⃣ 前向传播 ======
+                t0 = time.time()
+                logits = model(blocks, feats)
+                forward_time = time.time() - t0
 
-            # 4️⃣ 反向传播与优化
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                # ====== 3️⃣ 损失与反向传播 ======
+                loss = nn.functional.cross_entropy(logits, labels)
+                t1 = time.time()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                backward_time = time.time() - t1
 
-            # 5️⃣ 计算准确率
-            preds = logits.argmax(dim=1)
-            acc = (preds == labels).float().mean().item()
+                # ====== 4️⃣ 通信统计 ======
+                comm_monitor.stop()
+                comm_mb, comm_bw = comm_monitor.get_bandwidth()
 
-            total_loss += loss.item()
-            total_accuracy += acc
-            num_batches += 1
+                # ====== 5️⃣ 精度与耗时统计 ======
+                preds = logits.argmax(dim=1)
+                acc = (preds == labels).float().mean().item()
+                batch_time = time.time() - batch_start
 
-            if num_batches % 10 == 0:
-                print(f"Rank {rank} batch {num_batches}, loss: {loss.item():.4f}, acc: {acc:.4f}")
+                # ====== GPU内存监控 ======
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    gpu_memory_allocated = torch.cuda.memory_allocated(device) / (1024**2)  # MB
+                    gpu_memory_reserved = torch.cuda.memory_reserved(device) / (1024**2)  # MB
+                    gpu_utilization = GPUtil.getGPUs()[rank].load * 100  # %
+                else:
+                    gpu_memory_allocated = 0.0
+                    gpu_memory_reserved = 0.0
+                    gpu_utilization = 0.0
 
-        # 同步平均 loss 和 accuracy
-        avg_loss_tensor = torch.tensor(total_loss / max(num_batches, 1), device=device)
-        avg_acc_tensor = torch.tensor(total_accuracy / max(num_batches, 1), device=device)
-        dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acc_tensor, op=dist.ReduceOp.AVG)
-        avg_loss = avg_loss_tensor.item()
-        avg_accuracy = avg_acc_tensor.item()
+                total_loss += loss.item()
+                total_acc += acc
+                num_batches += 1
+                epoch_forward += forward_time
+                epoch_backward += backward_time
+                epoch_comm += comm_monitor.end_time - comm_monitor.start_time
+                epoch_batch += batch_time
+                epoch_comm_bw += comm_bw
+                epoch_comm_mb += comm_mb
+                if num_batches % 10 == 0 and rank == 0:
+                    print(f"[Rank {rank}] Batch {num_batches}: Loss={loss.item():.4f}, Acc={acc:.4f}, BW={comm_bw:.2f}MB/s, GPU Mem={gpu_memory_allocated:.2f}GB, GPU Util={gpu_utilization:.1f}%")
 
-        if writer and rank == 0:
-            writer.add_scalar("Loss/train", avg_loss, epoch)
-            writer.add_scalar("Accuracy/train", avg_accuracy, epoch)
 
-        print(f"Rank {rank} [Epoch {epoch+1}/{num_epochs}] 平均损失: {avg_loss:.4f}, 准确度: {avg_accuracy:.4f}")
 
-    # ============ 最终测试评估 ============
-    gnn.eval()
-    final_test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
+            # ===== 同步平均 =====
+            avg_loss = torch.tensor(total_loss / max(1, num_batches), device=device)
+            avg_acc = torch.tensor(total_acc / max(1, num_batches), device=device)
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(avg_acc, op=dist.ReduceOp.AVG)
 
-    if rank == 0:
-        torch.save(gnn.state_dict(), f"node_prediction_model_rank{rank}.pth")
-        print(f"Model saved as node_prediction_model_rank{rank}.pth")
-        print(f"Rank {rank} 最终测试准确度: {final_test_accuracy:.4f}")
+            # if epoch % 10 == 0:
+            # ===== 评估 =====
+            test_acc = evaluate(model, test_loader, device, rank, world_size, subg)
+            # ===== 写入TensorBoard =====
+            if rank == 0 and writer:
+                writer.add_scalar("Loss/train", avg_loss.item(), epoch)
+                writer.add_scalar("Accuracy/train", avg_acc.item(), epoch)
+                writer.add_scalar("Accuracy/test", test_acc, epoch)
+                writer.add_scalar("Time/forward", epoch_forward / num_batches, epoch)
+                writer.add_scalar("Time/backward", epoch_backward / num_batches, epoch)
+                writer.add_scalar("Time/comm", epoch_comm / num_batches, epoch)
+                writer.add_scalar("Time/batch", epoch_batch / num_batches, epoch)
+                writer.add_scalar("Comm/volume_MB", epoch_comm_mb / num_batches, epoch)
+                writer.add_scalar("Comm/bandwidth_MBps", epoch_comm_bw / num_batches, epoch)
+                writer.add_scalar("GPU/memory_allocated_GB", gpu_memory_allocated, epoch)
+                writer.add_scalar("GPU/memory_reserved_GB", gpu_memory_reserved, epoch)
+                writer.add_scalar("GPU/utilization_percent", gpu_utilization, epoch)
 
-    # 在所有训练结束后进行完整的测试评估
-    final_test_accuracy = evaluate(gnn, test_loader, device, rank, world_size)
+            if rank == 0:
+                print(f"RANK:{rank} - [Epoch {epoch+1}] Loss={avg_loss.item():.4f}, TrainAcc={avg_acc.item():.4f}, TestAcc={test_acc:.4f}")
 
-    # 收集所有进程的测试准确度
-    test_acc_tensor = torch.tensor(final_test_accuracy, device=device)
-    all_test_acc = [torch.zeros_like(test_acc_tensor) for _ in range(world_size)]
-    dist.all_gather(all_test_acc, test_acc_tensor)
-
-    # 计算平均测试准确度
-    avg_test_accuracy = sum([acc.item() for acc in all_test_acc]) / world_size
-
-    if rank == 0:
-        print(f"\n📊 最终测试结果:")
-        print(f"各进程测试准确度: {[acc.item() for acc in all_test_acc]}")
-        print(f"平均测试准确度: {avg_test_accuracy:.4f}")
-        writer.add_scalar("Accuracy/final_test", avg_test_accuracy, num_epochs)
-
-    dist.destroy_process_group()
     if writer:
         writer.close()
+    dist.barrier()
     if rank == 0:
-        print("✅ Node classification 训练完成！")
+        print("✅ 训练完成，所有指标已写入 TensorBoard。")
 
 
 # ==========================================================
-# 4️⃣ 评估函数
+# 5️⃣ 分布式入口
 # ==========================================================
-def evaluate(model, test_loader, device, rank, world_size):
-    """
-    节点分类模型评估函数
-    
-    关键参数设置:
-    - model: 待评估的GNN模型
-    - test_loader: 测试数据加载器
-    - device: 计算设备
-    - rank: 当前进程排名
-    - world_size: 进程总数
-    """
-    model.eval()
-    total_accuracy = 0.0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for input_nodes, output_nodes, blocks in test_loader:
-            # 1️⃣ 获取节点特征和标签
-            feats = blocks[0].srcdata["feat"].to(device)
-            labels = blocks[-1].dstdata["labels"].to(device)
-            
-            # 2️⃣ 前向传播获取预测结果
-            logits = model(blocks, feats)
-            
-            # 3️⃣ 计算准确度
-            preds = logits.argmax(dim=1)
-            accuracy = (preds == labels).float().mean().item()
-            
-            total_accuracy += accuracy
-            num_batches += 1
-    
-    # 4️⃣ 同步所有进程的准确度
-    avg_accuracy = total_accuracy / num_batches if num_batches > 0 else 0.0
-    avg_accuracy_tensor = torch.tensor(avg_accuracy, device=device)
-    dist.all_reduce(avg_accuracy_tensor, op=dist.ReduceOp.SUM)
-    avg_accuracy_tensor /= world_size
-    
-    model.train()
-    return avg_accuracy_tensor.item()
+def train_fn(rank, world_size, graph_dir, num_epochs=50, lr=0.001):
+    device = setup_distributed(rank, world_size)
+    train(rank, rank, world_size, device, graph_dir, num_epochs=num_epochs, lr=lr)
+    dist.destroy_process_group()
 
 
 # ==========================================================
-# 5️⃣ 主入口
+# 6️⃣ 图准备 + 启动
 # ==========================================================
+def prepare_graph(graph_dir="datasets/node_cls", num_parts=3, nodes=1000):
+    if not os.path.exists(graph_dir):
+        gen = GraphGenerator()
+        G_nx = gen.generate_nx_graph(kind="ER", n_nodes=nodes, p=0.01)
+        g = gen.nx_to_dgl(G_nx)
+        gen.add_node_labels(g)
+        gen.partition_graph(g, num_parts=num_parts, method="metis", output_dir=graph_dir)
+    return graph_dir
+
+
 if __name__ == "__main__":
-    graph_dir = prepare_graph(graph_dir="datasets/node_cls_ER", num_parts=3, nodes=1000)
     world_size = 3
-    device = None
-    # 使用mp.spawn启动分布式训练
-    mp.spawn(
-        train_fn,
-        args=(world_size, graph_dir),
-        nprocs=world_size,
-        join=True
-    )
+    graph_dir = prepare_graph(graph_dir="datasets/node_cls_ER", num_parts=3, nodes=1000)
+    num_epochs = 50
+    mp.spawn(train_fn, args=(world_size, graph_dir), nprocs=world_size, join=True)
