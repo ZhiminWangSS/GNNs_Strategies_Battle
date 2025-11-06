@@ -153,7 +153,9 @@ class GraphGenerator:
         os.makedirs(output_dir, exist_ok=True)
         # parts {part_id: subgraph}
         parts = {}
-        if method == 'metis':
+        if num_parts <= 1:
+            parts[0] = g
+        elif method == 'metis':
             raw_parts = dgl.metis_partition(g, num_parts)
 
             for pid, subg in raw_parts.items():
@@ -366,6 +368,7 @@ if __name__ == "__main__":
     seed = 123
     n_nodes = 2000
     p = 0.01
+    num_parts = 1
 
     gen = GraphGenerator(seed=123)
     G_nx = gen.generate_nx_graph(kind='ER', n_nodes=2000, p=0.01) # 生成可控图
@@ -374,11 +377,11 @@ if __name__ == "__main__":
         gen.add_node_labels(g)
 
         # 划分为 num_parts 个子图
-        gen.partition_graph(g, num_parts=3, method='metis',
+        gen.partition_graph(g, num_parts=num_parts, method='metis',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
-        gen.partition_graph(g, num_parts=3, method='random',
+        gen.partition_graph(g, num_parts=num_parts, method='random',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
-        gen.partition_graph(g, num_parts=3, method='direct',
+        gen.partition_graph(g, num_parts=num_parts, method='direct',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
 
         train_loader, test_loader, _ = gen.get_dataloader_for_node_classification(
@@ -413,11 +416,11 @@ if __name__ == "__main__":
     elif task == 'link_prediction':
 
         # 划分为 num_parts 个子图
-        gen.partition_graph(g, num_parts=3, method='metis',
+        gen.partition_graph(g, num_parts=num_parts, method='metis',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
-        gen.partition_graph(g, num_parts=3, method='random',
+        gen.partition_graph(g, num_parts=num_parts, method='random',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
-        gen.partition_graph(g, num_parts=3, method='direct',
+        gen.partition_graph(g, num_parts=num_parts, method='direct',
                             output_dir=f'./tmp/{task}/graph_nodes{n_nodes}_p{p}_parts')
 
         train_loader, test_loader, _ = gen.get_dataloader_for_link_prediction(
